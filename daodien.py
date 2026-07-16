@@ -265,8 +265,18 @@ def process_video(video_path: str, output_path: str, *,
     if remove_old_sub and old_sub_box:
         x, y, w, h = old_sub_box
         if old_sub_method == "blur":
+            # ffmpeg giới hạn bán kính làm mờ kênh màu (chroma_radius) phải < 18,
+            # trong khi kênh sáng (luma_radius) có thể lớn hơn — nếu dùng chung 1
+            # giá trị cho cả hai (như "boxblur=25:2") sẽ bị lỗi khi > 17. Tách
+            # riêng và luôn kẹp chroma trong giới hạn hợp lệ.
+            luma_radius = max(1, min(int(blur_strength), 40))
+            chroma_radius = max(1, min(luma_radius, 17))
             filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
-            filters.append(f"[vcrop{counter}]crop={w}:{h}:{x}:{y},boxblur={blur_strength}:2[vblur{counter}]")
+            filters.append(
+                f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
+                f"boxblur=luma_radius={luma_radius}:luma_power=2:"
+                f"chroma_radius={chroma_radius}:chroma_power=2[vblur{counter}]"
+            )
             filters.append(f"[vmain{counter}][vblur{counter}]overlay={x}:{y}[v{counter}]")
         elif old_sub_method == "delogo":
             filters.append(f"{stage}delogo=x={x}:y={y}:w={w}:h={h}:show=0[v{counter}]")
