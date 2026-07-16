@@ -1,0 +1,10 @@
+
+streamlit
+ffmpeg-python
+imageio-ffmpeg
+faster-whisper
+google-genai
+pysubs2
+opencv-python-headless
+Pillow
+numpy
