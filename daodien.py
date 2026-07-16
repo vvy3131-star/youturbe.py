@@ -2,16 +2,17 @@
 App Streamlit: Dịch phụ đề video tiếng Trung sang tiếng Việt — BẢN TỰ ĐỘNG HOÁ.
 
 Người dùng chỉ cần:
-    1) Tải video lên MÁY (hoặc dán thẳng link Douyin để app tự tải về)
+    1) Tải video lên MÁY
     2) Chọn cỡ chữ phụ đề mới
-    3) Chọn giọng đọc AI
+    3) Chọn phong cách giọng đọc AI (tốc độ/cao độ)
     4) Chọn màu chữ phụ đề mới
 Mọi thứ còn lại được xử lý TỰ ĐỘNG:
-    - Dán link https://www.douyin.com/... thì app TỰ TẢI VIDEO VỀ (dùng
-      yt-dlp), không cần tự tải xuống máy rồi mới upload lại.
     - Tự động phát hiện vùng phụ đề tiếng Trung gốc (ghi cứng trên hình) và
       tự động làm mờ (blur) để che đi, không cần tự kéo khung.
-    - Tự động lồng tiếng AI tiếng Việt cho toàn bộ video.
+    - Tự động NHẬN DIỆN GIỌNG NÓI GỐC trong video là NAM hay NỮ theo từng câu
+      thoại (dựa trên cao độ giọng nói - pitch), rồi TỰ ĐỘNG chọn giọng đọc AI
+      tiếng Việt tương ứng (nữ dùng giọng nữ, nam dùng giọng nam) — không cần
+      tự chọn giọng thủ công.
     - Tự động hạ âm lượng gốc xuống mức thấp nhất có thể mà vẫn giữ chút
       tiếng nền/nhạc nền phía sau giọng đọc AI (không tắt hẳn để video không
       bị "cụt" tiếng động).
@@ -23,9 +24,7 @@ tay chỉnh từng thông số như bản gốc.
 
 GIỚI HẠN DUNG LƯỢNG VIDEO:
     Mặc định Streamlit chỉ cho upload tối đa 200MB/file. Để nâng giới hạn
-    này (vd cho video upload trực tiếp, không áp dụng cho video tải qua
-    link Douyin vì link không đi qua giới hạn upload), tạo file
-    `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
+    này, tạo file `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
 
         [server]
         maxUploadSize = 2048
@@ -35,7 +34,7 @@ GIỚI HẠN DUNG LƯỢNG VIDEO:
     được đính kèm sẵn — chỉ cần copy vào đúng vị trí.
 
 CÀI ĐẶT (chạy 1 lần, local):
-    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy yt-dlp --break-system-packages
+    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy --break-system-packages
     # cần có ffmpeg cài sẵn trên máy (sudo apt install ffmpeg / brew install ffmpeg)
 
 CHẠY APP (local):
@@ -43,7 +42,7 @@ CHẠY APP (local):
 
 TRÊN STREAMLIT CLOUD:
     Cần có các file cùng thư mục gốc:
-    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy, yt-dlp)
+    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy)
     - packages.txt (ffmpeg)
     - .streamlit/config.toml (xem phần "GIỚI HẠN DUNG LƯỢNG VIDEO" ở trên)
 """
@@ -54,6 +53,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import wave
 
 import numpy as np
 import streamlit as st
@@ -71,21 +71,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- DANH SÁCH GIỌNG ĐỌC (edge-tts) ----------
-# Microsoft edge-tts hiện chỉ cung cấp 2 giọng tiếng Việt gốc (Hoài My - nữ,
-# Nam Minh - nam). Để có "nhiều giọng đọc" hơn cho người dùng lựa chọn, mỗi
-# giọng gốc được biến tấu thành vài "phong cách" khác nhau (tốc độ/cao độ),
-# nghe khác biệt rõ rệt mà vẫn tự nhiên. Khi Microsoft phát hành thêm giọng
-# tiếng Việt mới, chỉ cần thêm dòng vào dict bên dưới.
-VOICE_STYLE_OPTIONS = {
-    "👩 Hoài My - Chuẩn":            {"voice": "vi-VN-HoaiMyNeural",  "rate": 0,   "pitch": 0},
-    "👩 Hoài My - Nhẹ nhàng, chậm":   {"voice": "vi-VN-HoaiMyNeural",  "rate": -15, "pitch": -3},
-    "👩 Hoài My - Vui tươi, nhanh":   {"voice": "vi-VN-HoaiMyNeural",  "rate": 15,  "pitch": 3},
-    "👩 Hoài My - Trầm ấm":          {"voice": "vi-VN-HoaiMyNeural",  "rate": -5,  "pitch": -6},
-    "👨 Nam Minh - Chuẩn":           {"voice": "vi-VN-NamMinhNeural", "rate": 0,   "pitch": 0},
-    "👨 Nam Minh - Trầm, chậm rãi":  {"voice": "vi-VN-NamMinhNeural", "rate": -15, "pitch": -6},
-    "👨 Nam Minh - Nhanh, dứt khoát": {"voice": "vi-VN-NamMinhNeural", "rate": 15,  "pitch": 2},
-    "👨 Nam Minh - Trẻ trung, cao":  {"voice": "vi-VN-NamMinhNeural", "rate": 5,   "pitch": 6},
+# ---------- GIỌNG ĐỌC THEO GIỚI TÍNH (edge-tts) ----------
+# Microsoft edge-tts hiện chỉ cung cấp 2 giọng tiếng Việt gốc: Hoài My (nữ)
+# và Nam Minh (nam). App sẽ TỰ ĐỘNG chọn giọng nữ/nam tương ứng theo giọng
+# nói được NHẬN DIỆN trong từng câu thoại gốc của video, người dùng chỉ cần
+# chọn "phong cách" (tốc độ/cao độ) áp dụng chung cho cả hai giọng.
+GENDER_VOICE_MAP = {
+    "female": "vi-VN-HoaiMyNeural",
+    "male": "vi-VN-NamMinhNeural",
+}
+GENDER_LABEL = {"female": "👩 Nữ", "male": "👨 Nam"}
+
+STYLE_OPTIONS = {
+    "🙂 Chuẩn": {"rate": 0, "pitch": 0},
+    "🐢 Nhẹ nhàng, chậm": {"rate": -15, "pitch": -3},
+    "⚡ Vui tươi, nhanh": {"rate": 15, "pitch": 3},
+    "🎙️ Trầm ấm": {"rate": -5, "pitch": -6},
 }
 
 # ---------- VỊ TRÍ PHỤ ĐỀ MỚI (ASS Alignment - kiểu numpad) ----------
@@ -112,6 +113,11 @@ SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe th
 AUTO_BG_VOLUME_PCT = 8
 # Âm lượng gốc tự động khi KHÔNG lồng tiếng (giữ nguyên).
 AUTO_NO_DUB_VOLUME_PCT = 100
+
+# Ngưỡng cao độ (Hz) để phân biệt giọng nữ/nam khi nhận diện tự động.
+# Giọng nam trưởng thành thường ~85-180Hz, giọng nữ thường ~165-255Hz,
+# nên 165Hz là ngưỡng phân tách phổ biến.
+GENDER_PITCH_THRESHOLD_HZ = 165.0
 
 
 # ============================================================
@@ -485,64 +491,111 @@ def detect_subtitle_region(video_path: str, width: int, height: int, tmp_dir: st
 
 
 # ============================================================
-# TẢI VIDEO TRỰC TIẾP TỪ LINK DOUYIN (không cần tự tải xuống máy rồi upload lại)
+# TỰ ĐỘNG NHẬN DIỆN GIỌNG NAM / NỮ TRONG VIDEO (theo cao độ - pitch)
 # ============================================================
+#
+# Ý tưởng: dùng ước lượng cao độ cơ bản (F0) bằng phương pháp tự tương quan
+# (autocorrelation) trên từng khung nhỏ (~40ms) trong mỗi câu thoại đã được
+# faster-whisper cắt sẵn theo thời gian (start/end). Lấy trung vị (median)
+# cao độ của các khung có tiếng nói rõ (bỏ khung im lặng) rồi so với ngưỡng
+# GENDER_PITCH_THRESHOLD_HZ để phân loại nam/nữ. Đây là cách nhận diện đơn
+# giản, không cần thư viện AI riêng biệt, hoạt động tốt với giọng nói đơn lẻ
+# rõ ràng nhưng có thể kém chính xác hơn với đoạn nhiều tiếng ồn/nhạc nền.
 
-class VideoDownloadError(RuntimeError):
-    pass
+def load_wav_mono16(path: str):
+    """Đọc file wav PCM 16-bit mono đã tách sẵn (từ extract_audio) thành mảng
+    numpy float32 trong khoảng [-1, 1] cùng sample rate."""
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples, sr
 
 
-def download_video_from_url(url: str, out_dir: str, progress_cb=None):
-    """Dùng yt-dlp để tải video từ link Douyin (hoặc các link video khác mà
-    yt-dlp hỗ trợ) về out_dir. Trả về (đường_dẫn_file, tiêu_đề)."""
-    try:
-        import yt_dlp
-    except ImportError:
-        raise VideoDownloadError(
-            "Chưa cài thư viện yt-dlp. Chạy: pip install yt-dlp --break-system-packages"
-        )
+def _estimate_pitch_autocorr(frame: "np.ndarray", sr: int, fmin: float = 70.0, fmax: float = 300.0):
+    """Ước lượng cao độ cơ bản (Hz) của 1 khung nhỏ bằng tự tương quan.
+    Trả về None nếu khung quá yên tĩnh hoặc không rõ chu kỳ (không phải giọng nói)."""
+    if frame.size == 0:
+        return None
+    frame = frame - np.mean(frame)
+    energy = float(np.sqrt(np.mean(frame ** 2)))
+    if energy < 0.01:
+        return None  # gần như im lặng, bỏ qua
 
-    out_template = os.path.join(out_dir, "douyin_%(id)s.%(ext)s")
+    windowed = frame * np.hanning(len(frame))
+    corr = np.correlate(windowed, windowed, mode="full")
+    corr = corr[len(corr) // 2:]
+    if corr[0] <= 0:
+        return None
+    corr = corr / corr[0]
 
-    def hook(d):
-        if progress_cb and d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded = d.get("downloaded_bytes", 0)
-            if total:
-                progress_cb(min(downloaded / total, 1.0))
+    min_lag = int(sr / fmax)
+    max_lag = int(sr / fmin)
+    max_lag = min(max_lag, len(corr) - 1)
+    if min_lag >= max_lag:
+        return None
 
-    ydl_opts = {
-        "outtmpl": out_template,
-        "format": "bv*+ba/best/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "progress_hooks": [hook] if progress_cb else [],
-    }
+    window_corr = corr[min_lag:max_lag]
+    if window_corr.size == 0:
+        return None
+    peak_idx = int(np.argmax(window_corr)) + min_lag
+    if corr[peak_idx] < 0.3:
+        return None  # không đủ tin cậy để coi là có cao độ rõ ràng
+    return sr / peak_idx
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base, _ = os.path.splitext(filepath)
-                for alt_ext in (".mp4", ".mkv", ".webm"):
-                    candidate = base + alt_ext
-                    if os.path.exists(candidate):
-                        filepath = candidate
-                        break
-            title = (info.get("title") or "video_douyin").strip()
-    except Exception as e:
-        raise VideoDownloadError(
-            f"Không tải được video từ link này. Có thể do: link sai/riêng tư/đã bị gỡ, "
-            f"video bị chặn khu vực, hoặc Douyin đã đổi cách bảo vệ link.\n\nChi tiết: {e}"
-        )
 
-    if not filepath or not os.path.exists(filepath):
-        raise VideoDownloadError("Tải xong nhưng không tìm thấy file video kết quả.")
+def estimate_segment_gender(samples: "np.ndarray", sr: int, start: float, end: float,
+                             frame_ms: float = 40.0, hop_ms: float = 20.0):
+    """Trả về (gender, median_f0) cho 1 khoảng thời gian [start, end) giây,
+    hoặc None nếu không đủ dữ liệu tin cậy để nhận diện."""
+    start_i = max(0, int(start * sr))
+    end_i = min(len(samples), int(end * sr))
+    if end_i <= start_i:
+        return None
 
-    return filepath, title
+    segment = samples[start_i:end_i]
+    frame_len = max(int(sr * frame_ms / 1000), 32)
+    hop_len = max(int(sr * hop_ms / 1000), 16)
+
+    pitches = []
+    i = 0
+    while i + frame_len <= len(segment):
+        f0 = _estimate_pitch_autocorr(segment[i:i + frame_len], sr)
+        if f0:
+            pitches.append(f0)
+        i += hop_len
+
+    if not pitches:
+        return None
+
+    median_f0 = float(np.median(pitches))
+    gender = "female" if median_f0 >= GENDER_PITCH_THRESHOLD_HZ else "male"
+    return gender, median_f0
+
+
+def detect_genders_for_segments(audio_path: str, segments, progress_cb=None):
+    """Gán seg['gender'] ('male'/'female') và seg['pitch_hz'] cho từng câu
+    thoại trong segments, dựa trên cao độ giọng nói gốc trong audio_path.
+    Nếu 1 câu không đủ dữ liệu tin cậy, sẽ dùng giới tính của câu liền trước
+    (giúp tránh nhảy giọng liên tục do lỗi nhận diện lẻ tẻ)."""
+    samples, sr = load_wav_mono16(audio_path)
+    last_gender = "female"
+
+    for i, seg in enumerate(segments):
+        result = estimate_segment_gender(samples, sr, seg["start"], seg["end"])
+        if result:
+            gender, f0 = result
+            seg["gender"] = gender
+            seg["pitch_hz"] = f0
+            last_gender = gender
+        else:
+            seg["gender"] = last_gender
+            seg["pitch_hz"] = None
+        if progress_cb:
+            progress_cb(i + 1, len(segments))
+
+    return segments
 
 
 # ============================================================
@@ -704,15 +757,17 @@ def _run_async(coro):
             loop.close()
 
 
-def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
+def synthesize_all_tts(items, rate: str, volume: str, pitch: str,
                         max_retries: int = 3, concurrency: int = 6, progress_cb=None):
+    """items: list các tuple (idx, text, raw_path, voice) — mỗi câu có thể dùng
+    1 giọng đọc khác nhau (nữ/nam) tuỳ theo giới tính đã nhận diện được."""
     import edge_tts
 
     failed_indices = set()
     done_count = 0
     lock = asyncio.Lock()
 
-    async def _synthesize_one(sem, idx, text, raw_path):
+    async def _synthesize_one(sem, idx, text, raw_path, voice):
         nonlocal done_count
         async with sem:
             success = False
@@ -734,7 +789,7 @@ def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
 
     async def _synthesize_all():
         sem = asyncio.Semaphore(concurrency)
-        await asyncio.gather(*[_synthesize_one(sem, idx, text, raw_path) for idx, text, raw_path in items])
+        await asyncio.gather(*[_synthesize_one(sem, idx, text, raw_path, voice) for idx, text, raw_path, voice in items])
 
     _run_async(_synthesize_all())
     return failed_indices
@@ -765,20 +820,23 @@ def make_silence(out_path: str, duration: float):
     )
 
 
-def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
+def build_dub_track(segments, rate: str, volume: str, pitch: str,
                      tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None):
+    """Lồng tiếng cho toàn bộ video: mỗi câu dùng giọng nữ/nam tương ứng với
+    seg['gender'] đã được nhận diện tự động trước đó (xem detect_genders_for_segments)."""
     items = []
     for i, seg in enumerate(segments):
         text = seg["translated"].strip()
         if text:
             raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
-            items.append((i, text, raw_path))
+            voice = GENDER_VOICE_MAP.get(seg.get("gender", "female"), GENDER_VOICE_MAP["female"])
+            items.append((i, text, raw_path, voice))
 
-    failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch,
+    failed_indices = synthesize_all_tts(items, rate, volume, pitch,
                                          concurrency=concurrency, progress_cb=progress_cb)
 
     seg_files = []
-    for idx, text, raw_path in items:
+    for idx, text, raw_path, voice in items:
         seg = segments[idx]
         slot_duration = max(seg["end"] - seg["start"], 0.3)
         fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
@@ -830,56 +888,20 @@ def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: st
 
 st.title("🎬 Dịch & lồng tiếng video Trung → Việt")
 st.caption(
-    "Chỉ cần tải video lên, chọn cỡ chữ, giọng đọc và màu chữ — mọi bước còn lại "
-    "(phát hiện & xoá phụ đề gốc, lồng tiếng AI, chỉnh âm lượng...) được xử lý tự động."
+    "Chỉ cần tải video lên, chọn cỡ chữ, phong cách giọng đọc và màu chữ — mọi bước còn lại "
+    "(phát hiện & xoá phụ đề gốc, nhận diện giọng nam/nữ để lồng tiếng đúng giới tính, "
+    "chỉnh âm lượng...) được xử lý tự động."
 )
 
 # ---------- 1) TẢI VIDEO ----------
-st.subheader("📥 Nguồn video")
-video_source_mode = st.radio(
-    "Chọn cách đưa video vào",
-    ["📤 Tải file từ máy", "🔗 Dán link Douyin (tự động tải về)"],
-    horizontal=True, label_visibility="collapsed",
-)
+st.subheader("📥 Tải video lên")
+uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
 
 active_video_path = None
 active_video_name = None
-
-if video_source_mode.startswith("📤"):
-    uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
-    if uploaded_file is not None:
-        active_video_path = get_persistent_video_path(uploaded_file)
-        active_video_name = uploaded_file.name
-else:
-    douyin_url = st.text_input(
-        "🔗 Dán link video Douyin vào đây",
-        placeholder="https://www.douyin.com/video/... hoặc link chia sẻ dạng v.douyin.com/...",
-    )
-    dl_col1, dl_col2 = st.columns([1, 3])
-    with dl_col1:
-        do_download = st.button("⬇️ Tải video về", disabled=not douyin_url.strip())
-
-    if do_download and douyin_url.strip():
-        ensure_workdir()
-        dl_progress = st.progress(0.0, text="Đang tải video từ Douyin...")
-        try:
-            dl_path, dl_title = download_video_from_url(
-                douyin_url.strip(), st.session_state.workdir,
-                progress_cb=lambda p: dl_progress.progress(p, text=f"Đang tải video từ Douyin... {int(p * 100)}%"),
-            )
-            dl_progress.progress(1.0, text="Tải xong!")
-            st.session_state.douyin_video_path = dl_path
-            st.session_state.douyin_video_name = (dl_title or "video_douyin") + os.path.splitext(dl_path)[1]
-            st.session_state.douyin_source_url = douyin_url.strip()
-            st.success(f"✅ Đã tải xong: {dl_title}")
-        except VideoDownloadError as e:
-            st.error(f"❌ {e}")
-            st.session_state.douyin_video_path = None
-
-    if st.session_state.get("douyin_video_path") and os.path.exists(st.session_state.douyin_video_path):
-        active_video_path = st.session_state.douyin_video_path
-        active_video_name = st.session_state.get("douyin_video_name", "video_douyin.mp4")
-        st.caption(f"🎬 Video đang dùng: **{active_video_name}**")
+if uploaded_file is not None:
+    active_video_path = get_persistent_video_path(uploaded_file)
+    active_video_name = uploaded_file.name
 
 preview_frame_path = None
 preview_video_res = None
@@ -896,7 +918,7 @@ if active_video_path is not None:
         with st.spinner("🔎 Đang tự động phát hiện vùng phụ đề gốc..."):
             detected_box = ensure_detected_box(persistent_video_path, pw, ph)
 else:
-    st.info("👆 Hãy tải video lên hoặc dán link Douyin để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
+    st.info("👆 Hãy tải video lên để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
 
 pw, ph = preview_video_res if preview_video_res else (None, None)
 
@@ -915,8 +937,12 @@ with c1:
 with c2:
     text_color = st.color_picker("🎨 Màu chữ phụ đề", "#FFFFFF")
 
-voice_style_label = st.selectbox("🎙️ Giọng đọc lồng tiếng AI", list(VOICE_STYLE_OPTIONS.keys()))
-voice_style = VOICE_STYLE_OPTIONS[voice_style_label]
+style_label = st.selectbox("🎙️ Phong cách giọng đọc AI", list(STYLE_OPTIONS.keys()))
+st.caption(
+    "🧠 Giọng nam/nữ sẽ được **tự động nhận diện** theo giọng nói gốc trong từng câu thoại "
+    "của video — bạn chỉ cần chọn phong cách (tốc độ/cao độ) áp dụng chung."
+)
+style_cfg = STYLE_OPTIONS[style_label]
 
 # Các giá trị tự động suy ra từ 3 lựa chọn trên
 outline_color = auto_outline_color(text_color)
@@ -966,6 +992,10 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc — để 
     adv_override_bg_volume = st.checkbox("Tự chỉnh tay âm lượng nền gốc (thay vì để tự động ở mức thấp nhất)", value=False)
     adv_bg_volume_pct = st.slider("Âm lượng nền gốc (%)", 0, 100, AUTO_BG_VOLUME_PCT, step=1,
                                    disabled=not adv_override_bg_volume)
+    adv_override_gender_threshold = st.checkbox("Tự chỉnh tay ngưỡng nhận diện nam/nữ (thay vì mặc định 165Hz)", value=False)
+    adv_gender_threshold = st.slider("Ngưỡng cao độ phân biệt nam/nữ (Hz)", 100, 220, int(GENDER_PITCH_THRESHOLD_HZ),
+                                      step=5, disabled=not adv_override_gender_threshold,
+                                      help="Cao độ đo được CAO HƠN ngưỡng này sẽ được coi là giọng NỮ, THẤP HƠN là giọng NAM.")
 
     st.markdown("---")
     adv_model_size = st.selectbox("Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=1)
@@ -988,10 +1018,11 @@ blur_strength = adv_blur_strength
 
 enable_dub = not adv_disable_dub
 keep_bg = adv_keep_bg
-voice = voice_style["voice"]
-tts_rate_pct = voice_style["rate"]
+tts_rate_pct = style_cfg["rate"]
 tts_volume_pct = 0
-tts_pitch_hz = voice_style["pitch"]
+tts_pitch_hz = style_cfg["pitch"]
+gender_threshold_hz = adv_gender_threshold if adv_override_gender_threshold else GENDER_PITCH_THRESHOLD_HZ
+GENDER_PITCH_THRESHOLD_HZ = gender_threshold_hz  # cho phép ghi đè ngưỡng nếu người dùng tự chỉnh
 
 if enable_dub:
     original_volume_pct = adv_bg_volume_pct if adv_override_bg_volume else AUTO_BG_VOLUME_PCT
@@ -1012,7 +1043,7 @@ st.subheader("🖼️ Xem trước")
 
 combined_preview_ready = False
 if active_video_path is None:
-    st.info("Tải video lên hoặc dán link Douyin ở trên để xem bản xem trước.")
+    st.info("Tải video lên ở trên để xem bản xem trước.")
 elif preview_frame_path is None:
     st.warning("Không có khung hình xem trước cho video này — vẫn xử lý được, chỉ là không kiểm tra trước được vị trí/màu sắc.")
 else:
@@ -1037,25 +1068,38 @@ else:
         st.caption("💡 Nếu khung đỏ chưa khớp chính xác vùng phụ đề gốc, mở '⚙️ Tuỳ chỉnh nâng cao' để tự kéo tay.")
 
     if enable_dub:
-        st.markdown(f"**🔊 Nghe thử giọng đọc: {voice_style_label}**")
-        if st.button("▶️ Nghe thử giọng đọc mẫu", key="btn_tts_preview"):
-            with st.spinner("Đang tạo giọng đọc mẫu..."):
-                try:
-                    tts_preview_path = os.path.join(st.session_state.workdir, "tts_preview.mp3")
-                    generate_tts_preview_audio(
-                        voice,
-                        f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%",
-                        f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%",
-                        f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz",
-                        tts_preview_path,
-                    )
-                    with open(tts_preview_path, "rb") as f:
-                        st.session_state.tts_preview_bytes = f.read()
-                except Exception as e:
-                    st.error(f"Không tạo được giọng đọc mẫu: {e}")
-                    st.session_state.tts_preview_bytes = None
-        if st.session_state.get("tts_preview_bytes"):
-            st.audio(st.session_state.tts_preview_bytes, format="audio/mp3")
+        st.markdown(f"**🔊 Nghe thử phong cách: {style_label}**")
+        st.caption("Nghe thử cả 2 giọng — video thật sẽ tự động chọn đúng giọng theo từng câu thoại gốc.")
+        pcol1, pcol2 = st.columns(2)
+        rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
+        volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
+        pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
+        with pcol1:
+            if st.button("▶️ Nghe thử giọng 👩 Nữ", key="btn_tts_preview_female"):
+                with st.spinner("Đang tạo giọng đọc mẫu..."):
+                    try:
+                        p = os.path.join(st.session_state.workdir, "tts_preview_female.mp3")
+                        generate_tts_preview_audio(GENDER_VOICE_MAP["female"], rate_str, volume_str, pitch_str, p)
+                        with open(p, "rb") as f:
+                            st.session_state.tts_preview_female_bytes = f.read()
+                    except Exception as e:
+                        st.error(f"Không tạo được giọng đọc mẫu: {e}")
+                        st.session_state.tts_preview_female_bytes = None
+            if st.session_state.get("tts_preview_female_bytes"):
+                st.audio(st.session_state.tts_preview_female_bytes, format="audio/mp3")
+        with pcol2:
+            if st.button("▶️ Nghe thử giọng 👨 Nam", key="btn_tts_preview_male"):
+                with st.spinner("Đang tạo giọng đọc mẫu..."):
+                    try:
+                        p = os.path.join(st.session_state.workdir, "tts_preview_male.mp3")
+                        generate_tts_preview_audio(GENDER_VOICE_MAP["male"], rate_str, volume_str, pitch_str, p)
+                        with open(p, "rb") as f:
+                            st.session_state.tts_preview_male_bytes = f.read()
+                    except Exception as e:
+                        st.error(f"Không tạo được giọng đọc mẫu: {e}")
+                        st.session_state.tts_preview_male_bytes = None
+            if st.session_state.get("tts_preview_male_bytes"):
+                st.audio(st.session_state.tts_preview_male_bytes, format="audio/mp3")
 
     combined_preview_ready = True
 
@@ -1101,6 +1145,17 @@ if start_button:
                 status.update(label="Không nhận diện được giọng nói nào.", state="error")
                 st.stop()
             status.write(f"✅ Nhận diện xong {len(segments)} câu.")
+
+            if enable_dub:
+                status.write("🧑‍🤝‍🧑 Đang tự động nhận diện giọng nam/nữ trong video...")
+                gender_bar = st.progress(0)
+                segments = detect_genders_for_segments(
+                    audio_path, segments,
+                    progress_cb=lambda d, t: gender_bar.progress(d / t),
+                )
+                n_female = sum(1 for s in segments if s.get("gender") == "female")
+                n_male = len(segments) - n_female
+                status.write(f"✅ Đã nhận diện: {n_female} câu giọng nữ, {n_male} câu giọng nam.")
 
             status.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
             translate_bar = st.progress(0)
@@ -1150,14 +1205,14 @@ if start_button:
 
             dub_warning_count = 0
             if enable_dub:
-                status.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
+                status.write(f"🎙️ Đang tạo giọng đọc AI (tự động nữ/nam theo giọng gốc, phong cách: {style_label})...")
                 tts_bar = st.progress(0)
                 rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
                 volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
                 pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
 
                 dub_track_path, failed_indices = build_dub_track(
-                    segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
+                    segments, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
                     concurrency=speed_cfg["tts_concurrency"],
                     progress_cb=lambda d, t: tts_bar.progress(d / t)
                 )
@@ -1209,7 +1264,12 @@ if start_button:
 
         with st.expander("📜 Xem nội dung phụ đề"):
             for seg in segments:
-                st.write(f"**[{seg['start']:.1f}s - {seg['end']:.1f}s]**")
+                gender_bit = ""
+                if enable_dub and seg.get("gender"):
+                    gender_bit = f" · {GENDER_LABEL.get(seg['gender'], '')}"
+                    if seg.get("pitch_hz"):
+                        gender_bit += f" (~{seg['pitch_hz']:.0f}Hz)"
+                st.write(f"**[{seg['start']:.1f}s - {seg['end']:.1f}s]{gender_bit}**")
                 if bilingual:
                     st.write(f"🇨🇳 {seg['text']}")
                 st.write(f"🇻🇳 {seg['translated']}")
