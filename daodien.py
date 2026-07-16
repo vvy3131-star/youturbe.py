@@ -101,9 +101,25 @@ AUTO_NO_DUB_VOLUME_PCT = 100
 # CÁC HÀM XỬ LÝ CHUNG (không đổi logic xử lý video/audio thật)
 # ============================================================
 
+class FFmpegError(RuntimeError):
+    """Lỗi ffmpeg có kèm theo vài dòng cuối của stderr để hiển thị cho người dùng,
+    thay vì để Streamlit chặn và chỉ báo lỗi chung chung 'redacted'."""
+    pass
+
+
+def _run_ffmpeg(cmd, label: str = "ffmpeg"):
+    """Chạy 1 lệnh ffmpeg/ffprobe, bắt stderr để có thể báo lỗi rõ ràng ra giao
+    diện nếu thất bại (thay vì DEVNULL khiến lỗi thật bị nuốt mất)."""
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-15:]) if result.stderr else "(không có thông tin lỗi)"
+        raise FFmpegError(f"Bước '{label}' thất bại (mã lỗi {result.returncode}).\n\nChi tiết ffmpeg:\n{stderr_tail}")
+    return result
+
+
 def extract_audio(video_path: str, audio_path: str):
     cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_ffmpeg(cmd, label="tách âm thanh")
 
 
 def ffprobe_duration(path: str) -> float:
@@ -269,18 +285,23 @@ def process_video(video_path: str, output_path: str, *,
         filters.append(f"{stage}subtitles={srt_escaped}:force_style='{style}'[vout]")
         stage = "[vout]"
 
+    # libx264 yêu cầu chiều rộng/cao là số chẵn — nhiều video gốc có kích thước
+    # lẻ (vd 1919x1079) sẽ làm ffmpeg lỗi ngay lập tức nếu không ép về số chẵn.
+    filters.append(f"{stage}scale=trunc(iw/2)*2:trunc(ih/2)*2[veven]")
+    stage = "[veven]"
+
     filter_complex = ";".join(filters)
 
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-filter_complex", filter_complex,
-        "-map", stage, "-map", "0:a",
+        "-map", stage, "-map", "0:a?",
         "-c:v", "libx264", "-preset", video_preset, "-crf", "20",
         "-threads", "0",
         "-c:a", "copy",
         output_path,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_ffmpeg(cmd, label="xử lý hình ảnh video (xoá phụ đề gốc / ghi phụ đề mới)")
 
 
 def adjust_video_volume(video_path: str, output_path: str, volume_factor: float):
@@ -290,7 +311,7 @@ def adjust_video_volume(video_path: str, output_path: str, volume_factor: float)
         "-c:v", "copy",
         output_path,
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_ffmpeg(cmd, label="điều chỉnh âm lượng gốc")
 
 
 # ============================================================
@@ -690,7 +711,7 @@ def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
     filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
 
     cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_ffmpeg(cmd, label="ghép các đoạn giọng đọc AI thành 1 track")
     return dub_track_path, failed_indices
 
 
@@ -707,7 +728,7 @@ def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: st
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-shortest", output_path,
         ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_ffmpeg(cmd, label="ghép giọng lồng tiếng AI vào video")
 
 
 # ============================================================
@@ -928,86 +949,106 @@ if start_button:
 
         status = st.status("Đang xử lý...", expanded=True)
 
-        status.write("🔊 Đang tách âm thanh...")
-        extract_audio(input_path, audio_path)
-        total_duration = ffprobe_duration(input_path)
+        try:
+            status.write("🔊 Đang tách âm thanh...")
+            extract_audio(input_path, audio_path)
+            total_duration = ffprobe_duration(input_path)
 
-        status.write("🗣️ Đang nhận diện giọng nói tiếng Trung...")
-        transcribe_placeholder = st.empty()
-        segments = transcribe_audio(
-            audio_path, model_size, beam_size=speed_cfg["beam_size"],
-            progress_cb=lambda t, text: transcribe_placeholder.write(f"  [{t:.1f}s] {text}")
-        )
+            status.write("🗣️ Đang nhận diện giọng nói tiếng Trung...")
+            transcribe_placeholder = st.empty()
+            segments = transcribe_audio(
+                audio_path, model_size, beam_size=speed_cfg["beam_size"],
+                progress_cb=lambda t, text: transcribe_placeholder.write(f"  [{t:.1f}s] {text}")
+            )
 
-        if not segments:
-            status.update(label="Không nhận diện được giọng nói nào.", state="error")
+            if not segments:
+                status.update(label="Không nhận diện được giọng nói nào.", state="error")
+                st.stop()
+            status.write(f"✅ Nhận diện xong {len(segments)} câu.")
+
+            status.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
+            translate_bar = st.progress(0)
+            segments = translate_segments(segments, progress_cb=lambda d, t: translate_bar.progress(d / t))
+
+            srt_content = build_srt(segments, bilingual=bilingual)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+
+            original_volume_factor = original_volume_pct / 100.0
+            current_video = input_path
+
+            if remove_old_sub or burn_sub:
+                status.write("🎞️ Đang xử lý hình ảnh video (xoá phụ đề gốc tự động phát hiện / ghi phụ đề mới)...")
+                final_old_sub_box = None
+                if remove_old_sub:
+                    width, height = get_video_resolution(current_video)
+                    if adv_manual_old_box and manual_box_pct:
+                        final_old_sub_box = compute_free_box(width, height, *manual_box_pct)
+                    else:
+                        final_old_sub_box = detect_subtitle_region(current_video, width, height, tmp_dir)
+                    # Đảm bảo vùng che luôn nằm gọn trong khung hình, tránh lỗi crop tràn biên.
+                    if final_old_sub_box:
+                        bx, by, bw, bh = final_old_sub_box
+                        bw = min(bw, width - bx - 2)
+                        bh = min(bh, height - by - 2)
+                        if bw < 4 or bh < 4:
+                            final_old_sub_box = None
+                        else:
+                            final_old_sub_box = (bx, by, bw, bh)
+
+                processed_output = os.path.join(tmp_dir, "processed.mp4")
+                process_video(
+                    current_video, processed_output,
+                    remove_old_sub=remove_old_sub, old_sub_method=old_sub_method_key,
+                    old_sub_box=final_old_sub_box, old_sub_color=hex_to_ffmpeg_color(box_color),
+                    blur_strength=blur_strength,
+                    burn_new_sub=burn_sub, srt_path=srt_path,
+                    font_size=font_size,
+                    primary_color=hex_to_ass_color(text_color),
+                    outline_color=hex_to_ass_color(outline_color),
+                    alignment=POSITION_OPTIONS[position_label],
+                    margin_v=margin_v,
+                    video_preset=speed_cfg["video_preset"],
+                )
+                current_video = processed_output
+
+            dub_warning_count = 0
+            if enable_dub:
+                status.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
+                tts_bar = st.progress(0)
+                rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
+                volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
+                pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
+
+                dub_track_path, failed_indices = build_dub_track(
+                    segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
+                    concurrency=speed_cfg["tts_concurrency"],
+                    progress_cb=lambda d, t: tts_bar.progress(d / t)
+                )
+                dub_warning_count = len(failed_indices)
+
+                status.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
+                dub_output = os.path.join(tmp_dir, "with_dub.mp4")
+                combine_video_with_dub(current_video, dub_track_path, dub_output,
+                                        keep_bg=keep_bg, bg_volume=original_volume_factor)
+                current_video = dub_output
+            elif original_volume_factor != 1.0:
+                status.write("🔊 Đang điều chỉnh âm lượng video gốc...")
+                vol_output = os.path.join(tmp_dir, "with_volume.mp4")
+                adjust_video_volume(current_video, vol_output, original_volume_factor)
+                current_video = vol_output
+
+            status.update(label="Hoàn tất!", state="complete")
+        except FFmpegError as e:
+            status.update(label="Xử lý thất bại ❌", state="error")
+            st.error(f"❌ {e}")
+            st.info("💡 Lỗi thường gặp: video có codec lạ, không có audio, hoặc vùng che phụ đề tràn khung hình. "
+                     "Thử video khác hoặc mở '⚙️ Tuỳ chỉnh nâng cao' để tự chỉnh vùng che / tắt bớt bước xử lý.")
             st.stop()
-        status.write(f"✅ Nhận diện xong {len(segments)} câu.")
-
-        status.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
-        translate_bar = st.progress(0)
-        segments = translate_segments(segments, progress_cb=lambda d, t: translate_bar.progress(d / t))
-
-        srt_content = build_srt(segments, bilingual=bilingual)
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_content)
-
-        original_volume_factor = original_volume_pct / 100.0
-        current_video = input_path
-
-        if remove_old_sub or burn_sub:
-            status.write("🎞️ Đang xử lý hình ảnh video (xoá phụ đề gốc tự động phát hiện / ghi phụ đề mới)...")
-            final_old_sub_box = None
-            if remove_old_sub:
-                width, height = get_video_resolution(current_video)
-                if adv_manual_old_box and manual_box_pct:
-                    final_old_sub_box = compute_free_box(width, height, *manual_box_pct)
-                else:
-                    final_old_sub_box = detect_subtitle_region(current_video, width, height, tmp_dir)
-
-            processed_output = os.path.join(tmp_dir, "processed.mp4")
-            process_video(
-                current_video, processed_output,
-                remove_old_sub=remove_old_sub, old_sub_method=old_sub_method_key,
-                old_sub_box=final_old_sub_box, old_sub_color=hex_to_ffmpeg_color(box_color),
-                blur_strength=blur_strength,
-                burn_new_sub=burn_sub, srt_path=srt_path,
-                font_size=font_size,
-                primary_color=hex_to_ass_color(text_color),
-                outline_color=hex_to_ass_color(outline_color),
-                alignment=POSITION_OPTIONS[position_label],
-                margin_v=margin_v,
-                video_preset=speed_cfg["video_preset"],
-            )
-            current_video = processed_output
-
-        dub_warning_count = 0
-        if enable_dub:
-            status.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
-            tts_bar = st.progress(0)
-            rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
-            volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
-            pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
-
-            dub_track_path, failed_indices = build_dub_track(
-                segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
-                concurrency=speed_cfg["tts_concurrency"],
-                progress_cb=lambda d, t: tts_bar.progress(d / t)
-            )
-            dub_warning_count = len(failed_indices)
-
-            status.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
-            dub_output = os.path.join(tmp_dir, "with_dub.mp4")
-            combine_video_with_dub(current_video, dub_track_path, dub_output,
-                                    keep_bg=keep_bg, bg_volume=original_volume_factor)
-            current_video = dub_output
-        elif original_volume_factor != 1.0:
-            status.write("🔊 Đang điều chỉnh âm lượng video gốc...")
-            vol_output = os.path.join(tmp_dir, "with_volume.mp4")
-            adjust_video_volume(current_video, vol_output, original_volume_factor)
-            current_video = vol_output
-
-        status.update(label="Hoàn tất!", state="complete")
+        except Exception as e:
+            status.update(label="Xử lý thất bại ❌", state="error")
+            st.error(f"❌ Lỗi không mong muốn: {e}")
+            st.stop()
 
         if dub_warning_count > 0:
             st.warning(
