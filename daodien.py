@@ -1,17 +1,7 @@
 
 
-### 🌟 Các điểm nâng cấp nổi bật
 
-1. **Bỏ chế độ tự động nhận diện giới tính & tự lồng tiếng cũ**: Loại bỏ hoàn toàn thuật toán phân tích pitch phức tạp và dễ lỗi. Thay vào đó, bạn có một **menu lựa chọn một giọng đọc duy nhất** cho toàn bộ video, hoạt động cực kỳ mượt mà và ổn định.
-2. **Sửa lỗi AI đọc quá nhanh**: Cấu hình mặc định tốc độ đọc về trạng thái **đàm thoại tự nhiên của người Việt (`rate="+0%"`)**. Bạn có thể tùy chỉnh thêm tốc độ qua thanh trượt nếu muốn.
-3. **Thêm hàng loạt giọng nữ chất lượng (Voice Profiles)**: Khắc phục sự tẻ nhạt của giọng nữ bằng cách tạo ra các bộ lọc giọng "Hoài My" đa dạng: *Ấm áp, Trẻ trung, Dịu dàng, Mặc định* bằng cách tối ưu hóa tần số và nhịp điệu của Edge-TTS, cùng giọng Google làm phong phú thêm lựa chọn.
-4. **Nâng cấp độ chính xác xóa phụ đề**: Thuật toán phân tích năng lượng cạnh (Edge Energy) được cải tiến để định vị dải chữ chính xác hơn, kết hợp tính năng **bù trừ biên (padding)** thông minh để không bỏ sót viền chữ.
-5. **Tính năng đóng dấu Logo tròn góc trên bên trái**: Hỗ trợ upload ảnh logo bất kỳ (JPG/PNG). Hệ thống sẽ tự động cắt bo tròn thành hình tròn hoàn hảo, tối ưu kích thước theo độ phân giải video và chèn trực tiếp vào góc trái màn hình thông qua bộ lọc Ffmpeg tốc độ cao.
-6. **Tối ưu hóa bản dịch**: Cải thiện khâu xử lý chuỗi trước và sau khi dịch của Google Translator, giúp loại bỏ các từ lặp thừa và tối ưu ngữ nghĩa cho tự nhiên nhất.
 
-Dưới đây là mã nguồn hoàn chỉnh của file `app.py`:
-
-```python
 import asyncio
 import hashlib
 import os
