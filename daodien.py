@@ -2,11 +2,13 @@
 App Streamlit: Dịch phụ đề video tiếng Trung sang tiếng Việt — BẢN TỰ ĐỘNG HOÁ.
 
 Người dùng chỉ cần:
-    1) Tải video lên
+    1) Tải video lên MÁY (hoặc dán thẳng link Douyin để app tự tải về)
     2) Chọn cỡ chữ phụ đề mới
     3) Chọn giọng đọc AI
     4) Chọn màu chữ phụ đề mới
 Mọi thứ còn lại được xử lý TỰ ĐỘNG:
+    - Dán link https://www.douyin.com/... thì app TỰ TẢI VIDEO VỀ (dùng
+      yt-dlp), không cần tự tải xuống máy rồi mới upload lại.
     - Tự động phát hiện vùng phụ đề tiếng Trung gốc (ghi cứng trên hình) và
       tự động làm mờ (blur) để che đi, không cần tự kéo khung.
     - Tự động lồng tiếng AI tiếng Việt cho toàn bộ video.
@@ -19,22 +21,37 @@ Mọi thứ còn lại được xử lý TỰ ĐỘNG:
 Vẫn có một khối "Tuỳ chỉnh nâng cao (không bắt buộc)" ẩn sẵn cho ai muốn tự
 tay chỉnh từng thông số như bản gốc.
 
+GIỚI HẠN DUNG LƯỢNG VIDEO:
+    Mặc định Streamlit chỉ cho upload tối đa 200MB/file. Để nâng giới hạn
+    này (vd cho video upload trực tiếp, không áp dụng cho video tải qua
+    link Douyin vì link không đi qua giới hạn upload), tạo file
+    `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
+
+        [server]
+        maxUploadSize = 2048
+        maxMessageSize = 2048
+
+    (2048 = 2048MB = 2GB, có thể chỉnh số này tuỳ nhu cầu). File mẫu này
+    được đính kèm sẵn — chỉ cần copy vào đúng vị trí.
+
 CÀI ĐẶT (chạy 1 lần, local):
-    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy --break-system-packages
+    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy yt-dlp --break-system-packages
     # cần có ffmpeg cài sẵn trên máy (sudo apt install ffmpeg / brew install ffmpeg)
 
 CHẠY APP (local):
     streamlit run app.py
 
 TRÊN STREAMLIT CLOUD:
-    Cần có 2 file cùng thư mục gốc:
-    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy)
+    Cần có các file cùng thư mục gốc:
+    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy, yt-dlp)
     - packages.txt (ffmpeg)
+    - .streamlit/config.toml (xem phần "GIỚI HẠN DUNG LƯỢNG VIDEO" ở trên)
 """
 
 import asyncio
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -468,14 +485,80 @@ def detect_subtitle_region(video_path: str, width: int, height: int, tmp_dir: st
 
 
 # ============================================================
+# TẢI VIDEO TRỰC TIẾP TỪ LINK DOUYIN (không cần tự tải xuống máy rồi upload lại)
+# ============================================================
+
+class VideoDownloadError(RuntimeError):
+    pass
+
+
+def download_video_from_url(url: str, out_dir: str, progress_cb=None):
+    """Dùng yt-dlp để tải video từ link Douyin (hoặc các link video khác mà
+    yt-dlp hỗ trợ) về out_dir. Trả về (đường_dẫn_file, tiêu_đề)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        raise VideoDownloadError(
+            "Chưa cài thư viện yt-dlp. Chạy: pip install yt-dlp --break-system-packages"
+        )
+
+    out_template = os.path.join(out_dir, "douyin_%(id)s.%(ext)s")
+
+    def hook(d):
+        if progress_cb and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            if total:
+                progress_cb(min(downloaded / total, 1.0))
+
+    ydl_opts = {
+        "outtmpl": out_template,
+        "format": "bv*+ba/best/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "progress_hooks": [hook] if progress_cb else [],
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base, _ = os.path.splitext(filepath)
+                for alt_ext in (".mp4", ".mkv", ".webm"):
+                    candidate = base + alt_ext
+                    if os.path.exists(candidate):
+                        filepath = candidate
+                        break
+            title = (info.get("title") or "video_douyin").strip()
+    except Exception as e:
+        raise VideoDownloadError(
+            f"Không tải được video từ link này. Có thể do: link sai/riêng tư/đã bị gỡ, "
+            f"video bị chặn khu vực, hoặc Douyin đã đổi cách bảo vệ link.\n\nChi tiết: {e}"
+        )
+
+    if not filepath or not os.path.exists(filepath):
+        raise VideoDownloadError("Tải xong nhưng không tìm thấy file video kết quả.")
+
+    return filepath, title
+
+
+# ============================================================
 # CÁC HÀM XEM TRƯỚC (PREVIEW) — chỉ thao tác trên 1 khung hình mẫu, cực nhanh
 # ============================================================
+
+def ensure_workdir() -> str:
+    if "workdir" not in st.session_state:
+        st.session_state.workdir = tempfile.mkdtemp(prefix="vidtrans_")
+    return st.session_state.workdir
+
 
 def get_persistent_video_path(uploaded_file) -> str:
     """Lưu file upload vào thư mục tạm bền vững (giữ được qua các lần Streamlit tự
     rerun khi kéo thanh trượt) để tạo ảnh xem trước ngay lập tức."""
-    if "workdir" not in st.session_state:
-        st.session_state.workdir = tempfile.mkdtemp(prefix="vidtrans_")
+    ensure_workdir()
 
     file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()[:10]
     ext = os.path.splitext(uploaded_file.name)[1] or ".mp4"
@@ -752,14 +835,58 @@ st.caption(
 )
 
 # ---------- 1) TẢI VIDEO ----------
-uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
+st.subheader("📥 Nguồn video")
+video_source_mode = st.radio(
+    "Chọn cách đưa video vào",
+    ["📤 Tải file từ máy", "🔗 Dán link Douyin (tự động tải về)"],
+    horizontal=True, label_visibility="collapsed",
+)
+
+active_video_path = None
+active_video_name = None
+
+if video_source_mode.startswith("📤"):
+    uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
+    if uploaded_file is not None:
+        active_video_path = get_persistent_video_path(uploaded_file)
+        active_video_name = uploaded_file.name
+else:
+    douyin_url = st.text_input(
+        "🔗 Dán link video Douyin vào đây",
+        placeholder="https://www.douyin.com/video/... hoặc link chia sẻ dạng v.douyin.com/...",
+    )
+    dl_col1, dl_col2 = st.columns([1, 3])
+    with dl_col1:
+        do_download = st.button("⬇️ Tải video về", disabled=not douyin_url.strip())
+
+    if do_download and douyin_url.strip():
+        ensure_workdir()
+        dl_progress = st.progress(0.0, text="Đang tải video từ Douyin...")
+        try:
+            dl_path, dl_title = download_video_from_url(
+                douyin_url.strip(), st.session_state.workdir,
+                progress_cb=lambda p: dl_progress.progress(p, text=f"Đang tải video từ Douyin... {int(p * 100)}%"),
+            )
+            dl_progress.progress(1.0, text="Tải xong!")
+            st.session_state.douyin_video_path = dl_path
+            st.session_state.douyin_video_name = (dl_title or "video_douyin") + os.path.splitext(dl_path)[1]
+            st.session_state.douyin_source_url = douyin_url.strip()
+            st.success(f"✅ Đã tải xong: {dl_title}")
+        except VideoDownloadError as e:
+            st.error(f"❌ {e}")
+            st.session_state.douyin_video_path = None
+
+    if st.session_state.get("douyin_video_path") and os.path.exists(st.session_state.douyin_video_path):
+        active_video_path = st.session_state.douyin_video_path
+        active_video_name = st.session_state.get("douyin_video_name", "video_douyin.mp4")
+        st.caption(f"🎬 Video đang dùng: **{active_video_name}**")
 
 preview_frame_path = None
 preview_video_res = None
 detected_box = None
 
-if uploaded_file is not None:
-    persistent_video_path = get_persistent_video_path(uploaded_file)
+if active_video_path is not None:
+    persistent_video_path = active_video_path
     with st.spinner("Đang chuẩn bị khung hình xem trước..."):
         preview_frame_path, preview_video_res = ensure_preview_frame(persistent_video_path)
     if preview_frame_path is None:
@@ -769,7 +896,7 @@ if uploaded_file is not None:
         with st.spinner("🔎 Đang tự động phát hiện vùng phụ đề gốc..."):
             detected_box = ensure_detected_box(persistent_video_path, pw, ph)
 else:
-    st.info("👆 Hãy tải video lên để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
+    st.info("👆 Hãy tải video lên hoặc dán link Douyin để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
 
 pw, ph = preview_video_res if preview_video_res else (None, None)
 
@@ -884,8 +1011,8 @@ st.divider()
 st.subheader("🖼️ Xem trước")
 
 combined_preview_ready = False
-if uploaded_file is None:
-    st.info("Tải video lên ở trên để xem bản xem trước.")
+if active_video_path is None:
+    st.info("Tải video lên hoặc dán link Douyin ở trên để xem bản xem trước.")
 elif preview_frame_path is None:
     st.warning("Không có khung hình xem trước cho video này — vẫn xử lý được, chỉ là không kiểm tra trước được vị trí/màu sắc.")
 else:
@@ -939,8 +1066,8 @@ confirm_preview = st.checkbox(
     value=False, disabled=not combined_preview_ready,
 )
 start_button = st.button("🚀 Bắt đầu xử lý", type="primary",
-                          disabled=(uploaded_file is None) or (not confirm_preview))
-if uploaded_file is not None and not confirm_preview:
+                          disabled=(active_video_path is None) or (not confirm_preview))
+if active_video_path is not None and not confirm_preview:
     st.caption("👆 Tick vào ô xác nhận sau khi xem bản xem trước để mở khóa nút xử lý.")
 
 if start_button:
@@ -949,10 +1076,9 @@ if start_button:
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        ext = os.path.splitext(uploaded_file.name)[1] or ".mp4"
+        ext = os.path.splitext(active_video_name or active_video_path)[1] or ".mp4"
         input_path = os.path.join(tmp_dir, "input" + ext)
-        with open(input_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        shutil.copy(active_video_path, input_path)
 
         audio_path = os.path.join(tmp_dir, "audio.wav")
         srt_path = os.path.join(tmp_dir, "output.srt")
