@@ -253,7 +253,10 @@ def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
     filter_complex = ";".join(filter_parts)
     if filter_complex:
         filter_complex += ";"
-    filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0[aout]"
+    # normalize=0 là bắt buộc: mặc định ffmpeg amix sẽ tự chia nhỏ âm lượng theo số input
+    # được trộn, nên video càng nhiều câu phụ đề thì giọng đọc AI càng bị nhỏ dần tới mức
+    # gần như không nghe thấy. Đây là nguyên nhân chính khiến "AI không đọc được".
+    filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
 
     cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -263,9 +266,12 @@ def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
 def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str,
                             keep_bg: bool, bg_volume: float = 0.15):
     if keep_bg:
+        # normalize=0: không để ffmpeg tự chia đôi âm lượng của bg và dub khi trộn —
+        # âm lượng nền gốc đã được chỉnh qua "volume={bg_volume}" nên giữ nguyên tỉ lệ đó,
+        # không giảm thêm giọng đọc AI.
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
-            "-filter_complex", f"[0:a]volume={bg_volume}[bg];[1:a]anull[dub];[bg][dub]amix=inputs=2:duration=first[aout]",
+            "-filter_complex", f"[0:a]volume={bg_volume}[bg];[1:a]anull[dub];[bg][dub]amix=inputs=2:duration=first:normalize=0[aout]",
             "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-shortest", output_path,
         ]
     else:
