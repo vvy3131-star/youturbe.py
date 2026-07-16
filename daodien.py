@@ -1,6 +1,8 @@
 """
 App Streamlit: Dịch phụ đề video tiếng Trung sang tiếng Việt,
-ghi phụ đề vào video, và lồng tiếng AI bằng giọng đọc tiếng Việt.
+ghi phụ đề vào video (tùy chỉnh màu, cỡ chữ, vị trí), điều chỉnh âm lượng
+video gốc, và lồng tiếng AI bằng giọng đọc tiếng Việt (tùy chỉnh tốc độ,
+âm lượng giọng đọc) — có cơ chế tự phục hồi khi AI đọc lỗi.
 
 CÀI ĐẶT (chạy 1 lần, local):
     pip install streamlit faster-whisper deep-translator edge-tts --break-system-packages
@@ -25,11 +27,16 @@ import streamlit as st
 st.set_page_config(page_title="Dịch phụ đề & Lồng tiếng video Trung -> Việt", page_icon="🎬", layout="centered")
 
 # ---------- DANH SÁCH GIỌNG ĐỌC (edge-tts, tiếng Việt) ----------
-VOICE_PROFILES = {
-    "Nữ - Hoài My (hoạt ngôn, nhanh nhẹn)": {"voice": "vi-VN-HoaiMyNeural", "rate": "+20%", "pitch": "+10Hz"},
-    "Nữ - Hoài My (dịu dàng, tự nhiên)": {"voice": "vi-VN-HoaiMyNeural", "rate": "+0%", "pitch": "+0Hz"},
-    "Nam - Nam Minh (năng động)": {"voice": "vi-VN-NamMinhNeural", "rate": "+15%", "pitch": "+5Hz"},
-    "Nam - Nam Minh (trầm ấm, chững chạc)": {"voice": "vi-VN-NamMinhNeural", "rate": "+0%", "pitch": "-3Hz"},
+VOICE_OPTIONS = {
+    "Nữ - Hoài My": "vi-VN-HoaiMyNeural",
+    "Nam - Nam Minh": "vi-VN-NamMinhNeural",
+}
+
+# ---------- VỊ TRÍ PHỤ ĐỀ (ASS Alignment - kiểu numpad) ----------
+POSITION_OPTIONS = {
+    "Dưới (mặc định)": 2,
+    "Giữa màn hình": 5,
+    "Trên": 8,
 }
 
 
@@ -98,12 +105,41 @@ def build_srt(segments, bilingual: bool = False) -> str:
     return "\n".join(lines)
 
 
-def burn_subtitles(video_path: str, srt_path: str, output_path: str):
-    srt_escaped = srt_path.replace(":", "\\:")
+def hex_to_ass_color(hex_color: str, alpha: str = "00") -> str:
+    """Chuyển mã màu #RRGGBB (từ color picker) sang định dạng màu ASS/SSA (&HAABBGGRR&)."""
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "FFFFFF"
+    r, g, b = hex_color[0:2], hex_color[2:4], hex_color[4:6]
+    return f"&H{alpha}{b}{g}{r}&".upper()
+
+
+def burn_subtitles(video_path: str, srt_path: str, output_path: str,
+                    font_size: int = 20, primary_color: str = "&H00FFFFFF&",
+                    outline_color: str = "&H00000000&", alignment: int = 2,
+                    margin_v: int = 25):
+    # Dùng dấu / thay \ và escape dấu : để tránh lỗi filter trên đường dẫn kiểu Windows (C:\...)
+    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+    style = (
+        f"FontName=Arial,FontSize={font_size},PrimaryColour={primary_color},"
+        f"OutlineColour={outline_color},BorderStyle=1,Outline=1.2,Shadow=0.5,"
+        f"Alignment={alignment},MarginV={margin_v}"
+    )
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
-        "-vf", f"subtitles={srt_escaped}:force_style='FontName=Arial,FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=1'",
+        "-vf", f"subtitles={srt_escaped}:force_style='{style}'",
         "-c:a", "copy",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def adjust_video_volume(video_path: str, output_path: str, volume_factor: float):
+    """Điều chỉnh âm lượng của track audio gốc (giữ nguyên video)."""
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-filter:a", f"volume={volume_factor}",
+        "-c:v", "copy",
         output_path,
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -111,22 +147,44 @@ def burn_subtitles(video_path: str, srt_path: str, output_path: str):
 
 # ---------- CÁC HÀM LỒNG TIẾNG (TTS) ----------
 
-def synthesize_tts(text: str, voice: str, rate: str, pitch: str, out_path: str):
-    """Gọi thẳng thư viện edge_tts (Python) thay vì gọi lệnh CLI 'edge-tts',
-    vì trên một số môi trường (như Streamlit Cloud) lệnh CLI có thể không nằm trong PATH."""
-    import edge_tts
-
-    async def _run():
-        communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
-        await communicate.save(out_path)
-
+def _run_async(coro):
+    """Chạy 1 coroutine an toàn dù có event loop đang chạy sẵn hay không (fix lỗi hay gặp
+    trên Streamlit / một số môi trường server khiến AI không đọc được phụ đề)."""
     try:
-        asyncio.run(_run())
+        asyncio.run(coro)
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(_run())
-        loop.close()
+        try:
+            loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str, max_retries: int = 3):
+    """Đọc TTS cho toàn bộ các câu trong 1 batch async duy nhất (ổn định hơn việc gọi
+    asyncio.run() lặp lại nhiều lần). Trả về set các index bị lỗi (sau khi đã thử lại)."""
+    import edge_tts
+
+    failed_indices = set()
+
+    async def _synthesize_all():
+        for idx, text, raw_path in items:
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+                    await communicate.save(raw_path)
+                    if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                        success = True
+                        break
+                except Exception:
+                    await asyncio.sleep(0.6)
+            if not success:
+                failed_indices.add(idx)
+
+    _run_async(_synthesize_all())
+    return failed_indices
 
 
 def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
@@ -147,19 +205,39 @@ def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def build_dub_track(segments, voice_profile, tmp_dir, total_duration, progress_cb=None):
-    seg_files = []
+def make_silence(out_path: str, duration: float):
+    duration = max(duration, 0.1)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={duration}", out_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
+                     tmp_dir: str, total_duration: float, progress_cb=None):
+    # Bước 1: đọc TTS cho tất cả các câu có nội dung, trong 1 batch async (ổn định hơn)
+    items = []
     for i, seg in enumerate(segments):
         text = seg["translated"].strip()
+        if text:
+            raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
+            items.append((i, text, raw_path))
+
+    failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch)
+
+    # Bước 2: với mỗi câu, canh khớp thời lượng vào đúng khung của phụ đề
+    # Nếu câu nào AI đọc lỗi (dù đã thử lại) -> chèn khoảng lặng thay vì làm hỏng cả video
+    seg_files = []
+    for n, (idx, text, raw_path) in enumerate(items):
         if progress_cb:
-            progress_cb(i + 1, len(segments))
-        if not text:
-            continue
-        raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
-        fit_path = os.path.join(tmp_dir, f"tts_fit_{i}.wav")
-        synthesize_tts(text, voice_profile["voice"], voice_profile["rate"], voice_profile["pitch"], raw_path)
+            progress_cb(n + 1, len(items))
+        seg = segments[idx]
         slot_duration = max(seg["end"] - seg["start"], 0.3)
-        fit_audio_to_duration(raw_path, fit_path, slot_duration)
+        fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
+        if idx in failed_indices:
+            make_silence(fit_path, slot_duration)
+        else:
+            fit_audio_to_duration(raw_path, fit_path, slot_duration)
         seg_files.append((seg["start"], fit_path))
 
     dub_track_path = os.path.join(tmp_dir, "dub_track.wav")
@@ -179,10 +257,11 @@ def build_dub_track(segments, voice_profile, tmp_dir, total_duration, progress_c
 
     cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return dub_track_path
+    return dub_track_path, failed_indices
 
 
-def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str, keep_bg: bool, bg_volume: float = 0.15):
+def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str,
+                            keep_bg: bool, bg_volume: float = 0.15):
     if keep_bg:
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
@@ -211,10 +290,36 @@ with st.expander("⚙️ Tùy chọn nhận diện & phụ đề", expanded=True
         bilingual = st.checkbox("Hiện song ngữ (Trung + Việt) trong phụ đề chữ", value=False)
     burn_sub = st.checkbox("📝 Ghi phụ đề chữ lên video", value=True)
 
+    st.markdown("**Định dạng phụ đề**")
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        font_size = st.slider("Cỡ chữ", min_value=10, max_value=60, value=20, step=1, disabled=not burn_sub)
+        text_color = st.color_picker("Màu chữ", value="#FFFFFF", disabled=not burn_sub)
+    with fcol2:
+        position_label = st.selectbox("Vị trí phụ đề", list(POSITION_OPTIONS.keys()), disabled=not burn_sub)
+        margin_v = st.slider("Khoảng cách với mép (px)", min_value=0, max_value=150, value=25, step=5, disabled=not burn_sub)
+    outline_color = st.color_picker("Màu viền chữ", value="#000000", disabled=not burn_sub)
+
+with st.expander("🔊 Âm lượng video gốc", expanded=False):
+    original_volume_pct = st.slider(
+        "Âm lượng âm thanh gốc (%)", min_value=0, max_value=200, value=100, step=5,
+        help="Áp dụng cho track âm thanh gốc của video. Nếu bật lồng tiếng AI và giữ nền, "
+             "đây cũng là âm lượng của nền gốc phía sau giọng đọc AI."
+    )
+
 with st.expander("🎙️ Tùy chọn lồng tiếng AI", expanded=True):
     enable_dub = st.checkbox("Bật lồng tiếng AI bằng giọng đọc tiếng Việt", value=False)
-    voice_label = st.selectbox("Chọn giọng đọc", list(VOICE_PROFILES.keys()), disabled=not enable_dub)
-    keep_bg = st.checkbox("Giữ lại âm thanh/nhạc nền gốc (âm lượng nhỏ)", value=True, disabled=not enable_dub)
+    voice_label = st.selectbox("Chọn giọng đọc", list(VOICE_OPTIONS.keys()), disabled=not enable_dub)
+    keep_bg = st.checkbox("Giữ lại âm thanh/nhạc nền gốc (theo âm lượng gốc ở trên)", value=True, disabled=not enable_dub)
+
+    vcol1, vcol2 = st.columns(2)
+    with vcol1:
+        tts_rate_pct = st.slider("Tốc độ đọc (%)", min_value=-50, max_value=100, value=0, step=5, disabled=not enable_dub,
+                                  help="0% là tốc độ bình thường, số dương đọc nhanh hơn, số âm đọc chậm hơn.")
+    with vcol2:
+        tts_volume_pct = st.slider("Âm lượng giọng đọc AI (%)", min_value=-50, max_value=100, value=0, step=5, disabled=not enable_dub,
+                                    help="0% là âm lượng gốc của giọng đọc, số dương to hơn, số âm nhỏ hơn.")
+    tts_pitch_hz = st.slider("Cao độ giọng (Hz)", min_value=-20, max_value=20, value=0, step=1, disabled=not enable_dub)
 
 uploaded_file = st.file_uploader("Chọn file video", type=["mp4", "mkv", "mov", "avi"])
 
@@ -261,29 +366,58 @@ if uploaded_file is not None:
             with open(srt_path, "w", encoding="utf-8") as f:
                 f.write(srt_content)
 
-            # Bước 1: ghi phụ đề chữ (nếu chọn)
+            original_volume_factor = original_volume_pct / 100.0
             current_video = input_path
+
+            # Bước 1: ghi phụ đề chữ (nếu chọn), với màu / cỡ / vị trí tùy chỉnh
             if burn_sub:
                 status.write("🎞️ Đang ghi phụ đề chữ vào video...")
                 sub_output = os.path.join(tmp_dir, "with_sub.mp4")
-                burn_subtitles(current_video, srt_path, sub_output)
+                burn_subtitles(
+                    current_video, srt_path, sub_output,
+                    font_size=font_size,
+                    primary_color=hex_to_ass_color(text_color),
+                    outline_color=hex_to_ass_color(outline_color),
+                    alignment=POSITION_OPTIONS[position_label],
+                    margin_v=margin_v,
+                )
                 current_video = sub_output
 
             # Bước 2: lồng tiếng AI (nếu chọn)
+            dub_warning_count = 0
             if enable_dub:
                 status.write("🎙️ Đang tạo giọng đọc AI cho từng câu...")
                 tts_bar = st.progress(0)
-                voice_profile = VOICE_PROFILES[voice_label]
-                dub_track_path = build_dub_track(
-                    segments, voice_profile, tmp_dir, total_duration,
+                voice = VOICE_OPTIONS[voice_label]
+                rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
+                volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
+                pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
+
+                dub_track_path, failed_indices = build_dub_track(
+                    segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
                     progress_cb=lambda d, t: tts_bar.progress(d / t)
                 )
+                dub_warning_count = len(failed_indices)
+
                 status.write("🔀 Đang ghép giọng lồng tiếng vào video...")
                 dub_output = os.path.join(tmp_dir, "with_dub.mp4")
-                combine_video_with_dub(current_video, dub_track_path, dub_output, keep_bg=keep_bg)
+                combine_video_with_dub(current_video, dub_track_path, dub_output,
+                                        keep_bg=keep_bg, bg_volume=original_volume_factor)
                 current_video = dub_output
+            elif original_volume_factor != 1.0:
+                # Không lồng tiếng nhưng người dùng muốn chỉnh âm lượng gốc
+                status.write("🔊 Đang điều chỉnh âm lượng video gốc...")
+                vol_output = os.path.join(tmp_dir, "with_volume.mp4")
+                adjust_video_volume(current_video, vol_output, original_volume_factor)
+                current_video = vol_output
 
             status.update(label="Hoàn tất!", state="complete")
+
+            if dub_warning_count > 0:
+                st.warning(
+                    f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng khi gọi giọng đọc) "
+                    "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
+                )
 
             with open(current_video, "rb") as f:
                 video_bytes = f.read()
