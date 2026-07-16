@@ -1,93 +1,143 @@
+"""
+App Streamlit: Dịch phụ đề video tiếng Trung sang tiếng Việt — BẢN TỰ ĐỘNG HOÁ.
+
+Người dùng chỉ cần:
+    1) Tải video lên MÁY (hoặc dán thẳng link Douyin để app tự tải về)
+    2) Chọn cỡ chữ phụ đề mới
+    3) Chọn giọng đọc AI
+    4) Chọn màu chữ phụ đề mới
+Mọi thứ còn lại được xử lý TỰ ĐỘNG:
+    - Dán link https://www.douyin.com/... thì app TỰ TẢI VIDEO VỀ (dùng
+      yt-dlp), không cần tự tải xuống máy rồi mới upload lại.
+    - Tự động phát hiện vùng phụ đề tiếng Trung gốc (ghi cứng trên hình) và
+      tự động làm mờ (blur) để che đi, không cần tự kéo khung.
+    - Tự động lồng tiếng AI tiếng Việt cho toàn bộ video.
+    - Tự động hạ âm lượng gốc xuống mức thấp nhất có thể mà vẫn giữ chút
+      tiếng nền/nhạc nền phía sau giọng đọc AI (không tắt hẳn để video không
+      bị "cụt" tiếng động).
+    - Tự động chọn màu viền chữ tương phản với màu chữ đã chọn.
+    - Tự động chọn vị trí, lề, model nhận diện, tốc độ xử lý ở mức cân bằng.
+
+Vẫn có một khối "Tuỳ chỉnh nâng cao (không bắt buộc)" ẩn sẵn cho ai muốn tự
+tay chỉnh từng thông số như bản gốc.
+
+GIỚI HẠN DUNG LƯỢNG VIDEO:
+    Mặc định Streamlit chỉ cho upload tối đa 200MB/file. Để nâng giới hạn
+    này (vd cho video upload trực tiếp, không áp dụng cho video tải qua
+    link Douyin vì link không đi qua giới hạn upload), tạo file
+    `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
+
+        [server]
+        maxUploadSize = 2048
+        maxMessageSize = 2048
+
+    (2048 = 2048MB = 2GB, có thể chỉnh số này tuỳ nhu cầu). File mẫu này
+    được đính kèm sẵn — chỉ cần copy vào đúng vị trí.
+
+CÀI ĐẶT (chạy 1 lần, local):
+    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy yt-dlp --break-system-packages
+    # cần có ffmpeg cài sẵn trên máy (sudo apt install ffmpeg / brew install ffmpeg)
+
+CHẠY APP (local):
+    streamlit run app.py
+
+TRÊN STREAMLIT CLOUD:
+    Cần có các file cùng thư mục gốc:
+    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy, yt-dlp)
+    - packages.txt (ffmpeg)
+    - .streamlit/config.toml (xem phần "GIỚI HẠN DUNG LƯỢNG VIDEO" ở trên)
+"""
+
 import asyncio
 import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
+
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-# Khởi chạy giao diện dạng Wide siêu rộng để dễ kiểm soát
-st.set_page_config(page_title="Dịch & Lồng Tiếng Siêu Tốc", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Dịch phụ đề & Lồng tiếng video Trung -> Việt", page_icon="🎬", layout="centered")
 
-# CSS Thiết kế giao diện sống động, trực quan và nhiều màu sắc
+# CSS tối giản để gọn hơn trên điện thoại
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #f8fafc;
-    }
-    .main-title {
-        color: #1e3a8a;
-        font-weight: 800;
-        text-align: center;
-        margin-bottom: 2px;
-    }
-    .section-auto {
-        background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
-        padding: 18px;
-        border-radius: 12px;
-        border-left: 6px solid #0284c7;
-        margin-bottom: 18px;
-        color: #0369a1;
-    }
-    .section-manual {
-        background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
-        padding: 18px;
-        border-radius: 12px;
-        border-left: 6px solid #d97706;
-        margin-bottom: 18px;
-        color: #78350f;
-    }
-    .section-audio {
-        background: linear-gradient(135deg, #f3e8ff 0%, #e9d5ff 100%);
-        padding: 18px;
-        border-radius: 12px;
-        border-left: 6px solid #9333ea;
-        margin-bottom: 18px;
-        color: #6b21a8;
-    }
-    div[data-testid="stVerticalBlock"] > div:has(> div.stButton) button {
-        background: linear-gradient(90deg, #3b82f6 0%, #1d4ed8 100%) !important;
-        color: white !important;
-        font-weight: bold !important;
-        font-size: 1.2rem !important;
-        border-radius: 10px !important;
-        height: 55px !important;
-        border: none !important;
-        box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.5);
-    }
+    .block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 780px;}
+    div[data-testid="stVerticalBlock"] > div:has(> div.stButton) button {width: 100%;}
+    .stTabs [data-baseweb="tab"] {padding: 0.4rem 0.8rem; font-size: 0.92rem;}
+    div[data-testid="stSlider"] {padding-bottom: 0.2rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- DANH MỤC GIỌNG ĐỌC ----------
-VOICE_CATALOG = [
-    {"id": "female_default", "label": "👩 Hoài My - Giọng Chuẩn (Tự nhiên)", "provider": "edge", "voice": "vi-VN-HoaiMyNeural", "rate": "+0%", "pitch": "+0Hz"},
-    {"id": "female_young", "label": "👩 Hoài My - Trẻ trung, Vui vẻ", "provider": "edge", "voice": "vi-VN-HoaiMyNeural", "rate": "+4%", "pitch": "+2Hz"},
-    {"id": "female_gentle", "label": "👩 Hoài My - Dịu dàng", "provider": "edge", "voice": "vi-VN-HoaiMyNeural", "rate": "-4%", "pitch": "-1Hz"},
-    {"id": "google_female", "label": "👩 Giọng nữ Google (gTTS)", "provider": "gtts", "voice": "vi"},
-    {"id": "male_default", "label": "👨 Nam Minh - Mặc định", "provider": "edge", "voice": "vi-VN-NamMinhNeural", "rate": "+0%", "pitch": "+0Hz"},
-]
+# ---------- DANH SÁCH GIỌNG ĐỌC (edge-tts) ----------
+# Microsoft edge-tts hiện chỉ cung cấp 2 giọng tiếng Việt gốc (Hoài My - nữ,
+# Nam Minh - nam). Để có "nhiều giọng đọc" hơn cho người dùng lựa chọn, mỗi
+# giọng gốc được biến tấu thành vài "phong cách" khác nhau (tốc độ/cao độ),
+# nghe khác biệt rõ rệt mà vẫn tự nhiên. Khi Microsoft phát hành thêm giọng
+# tiếng Việt mới, chỉ cần thêm dòng vào dict bên dưới.
+VOICE_STYLE_OPTIONS = {
+    "👩 Hoài My - Chuẩn":            {"voice": "vi-VN-HoaiMyNeural",  "rate": 0,   "pitch": 0},
+    "👩 Hoài My - Nhẹ nhàng, chậm":   {"voice": "vi-VN-HoaiMyNeural",  "rate": -15, "pitch": -3},
+    "👩 Hoài My - Vui tươi, nhanh":   {"voice": "vi-VN-HoaiMyNeural",  "rate": 15,  "pitch": 3},
+    "👩 Hoài My - Trầm ấm":          {"voice": "vi-VN-HoaiMyNeural",  "rate": -5,  "pitch": -6},
+    "👨 Nam Minh - Chuẩn":           {"voice": "vi-VN-NamMinhNeural", "rate": 0,   "pitch": 0},
+    "👨 Nam Minh - Trầm, chậm rãi":  {"voice": "vi-VN-NamMinhNeural", "rate": -15, "pitch": -6},
+    "👨 Nam Minh - Nhanh, dứt khoát": {"voice": "vi-VN-NamMinhNeural", "rate": 15,  "pitch": 2},
+    "👨 Nam Minh - Trẻ trung, cao":  {"voice": "vi-VN-NamMinhNeural", "rate": 5,   "pitch": 6},
+}
+
+# ---------- VỊ TRÍ PHỤ ĐỀ MỚI (ASS Alignment - kiểu numpad) ----------
+POSITION_OPTIONS = {
+    "Dưới (mặc định)": 2,
+    "Giữa màn hình": 5,
+    "Trên": 8,
+}
+
+# ---------- CHẾ ĐỘ TỐC ĐỘ XỬ LÝ ----------
+SPEED_PRESETS = {
+    "⚡ Nhanh nhất": {"beam_size": 1, "video_preset": "ultrafast", "tts_concurrency": 10},
+    "⚖️ Cân bằng (khuyến nghị)": {"beam_size": 3, "video_preset": "veryfast", "tts_concurrency": 6},
+    "🎯 Chính xác nhất (chậm hơn)": {"beam_size": 5, "video_preset": "medium", "tts_concurrency": 4},
+}
 
 CPU_COUNT = os.cpu_count() or 4
 
+SAMPLE_SUBTITLE_TEXT = "Đây là câu phụ đề mẫu để xem trước"
+SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe thử trước khi xử lý toàn bộ video."
+
+# Âm lượng nền gốc tự động khi có lồng tiếng AI (mức thấp nhất nhưng không
+# tắt hẳn, để vẫn còn chút tiếng động/nhạc nền phía sau giọng đọc).
+AUTO_BG_VOLUME_PCT = 8
+# Âm lượng gốc tự động khi KHÔNG lồng tiếng (giữ nguyên).
+AUTO_NO_DUB_VOLUME_PCT = 100
+
+
 # ============================================================
-# CÁC HÀM CÔNG NGHỆ CHẠY ẨN TỐC ĐỘ CAO
+# CÁC HÀM XỬ LÝ CHUNG (không đổi logic xử lý video/audio thật)
 # ============================================================
 
 class FFmpegError(RuntimeError):
+    """Lỗi ffmpeg có kèm theo vài dòng cuối của stderr để hiển thị cho người dùng,
+    thay vì để Streamlit chặn và chỉ báo lỗi chung chung 'redacted'."""
     pass
 
+
 def _run_ffmpeg(cmd, label: str = "ffmpeg"):
+    """Chạy 1 lệnh ffmpeg/ffprobe, bắt stderr để có thể báo lỗi rõ ràng ra giao
+    diện nếu thất bại (thay vì DEVNULL khiến lỗi thật bị nuốt mất)."""
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-15:]) if result.stderr else "(không có thông tin)"
-        raise FFmpegError(f"Bước '{label}' thất bại.\n\nChi tiết:\n{stderr_tail}")
+        stderr_tail = "\n".join(result.stderr.strip().splitlines()[-15:]) if result.stderr else "(không có thông tin lỗi)"
+        raise FFmpegError(f"Bước '{label}' thất bại (mã lỗi {result.returncode}).\n\nChi tiết ffmpeg:\n{stderr_tail}")
     return result
 
+
 def extract_audio(video_path: str, audio_path: str):
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-threads", str(CPU_COUNT), audio_path]
-    _run_ffmpeg(cmd, label="trích xuất âm thanh gốc")
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path]
+    _run_ffmpeg(cmd, label="tách âm thanh")
+
 
 def ffprobe_duration(path: str) -> float:
     result = subprocess.run(
@@ -95,6 +145,7 @@ def ffprobe_duration(path: str) -> float:
         capture_output=True, text=True, check=True,
     )
     return float(result.stdout.strip())
+
 
 def get_video_resolution(path: str):
     result = subprocess.run(
@@ -105,12 +156,14 @@ def get_video_resolution(path: str):
     w_str, h_str = result.stdout.strip().split("x")
     return int(w_str), int(h_str)
 
+
 @st.cache_resource(show_spinner=False)
 def load_whisper_model(model_size: str):
     from faster_whisper import WhisperModel
     return WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=CPU_COUNT)
 
-def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 1, progress_cb=None):
+
+def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 3, progress_cb=None):
     model = load_whisper_model(model_size)
     segments, info = model.transcribe(audio_path, language="zh", vad_filter=True, beam_size=beam_size)
     results = []
@@ -120,13 +173,15 @@ def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 1, progr
             progress_cb(seg.end, seg.text.strip())
     return results
 
-def translate_segments_fast(segments, progress_cb=None, chunk_size: int = 80):
+
+def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source="zh-CN", target="vi")
 
     texts = [seg["text"] for seg in segments]
     translated_all = [None] * len(segments)
 
+    done = 0
     for start in range(0, len(texts), chunk_size):
         chunk = texts[start:start + chunk_size]
         try:
@@ -149,17 +204,9 @@ def translate_segments_fast(segments, progress_cb=None, chunk_size: int = 80):
             progress_cb(done, len(texts))
 
     for seg, translated in zip(segments, translated_all):
-        seg["translated"] = " ".join(translated.split()) if translated else seg["text"]
+        seg["translated"] = translated if translated else seg["text"]
     return segments
 
-def build_srt(segments) -> str:
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        lines.append(str(i))
-        lines.append(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}")
-        lines.append(seg["translated"])
-        lines.append("")
-    return "\n".join(lines)
 
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -168,6 +215,19 @@ def format_timestamp(seconds: float) -> str:
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
+
+def build_srt(segments, bilingual: bool = False) -> str:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        lines.append(str(i))
+        lines.append(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}")
+        if bilingual:
+            lines.append(seg["text"])
+        lines.append(seg["translated"])
+        lines.append("")
+    return "\n".join(lines)
+
+
 def hex_to_ass_color(hex_color: str, alpha: str = "00") -> str:
     hex_color = hex_color.lstrip("#")
     if len(hex_color) != 6:
@@ -175,7 +235,17 @@ def hex_to_ass_color(hex_color: str, alpha: str = "00") -> str:
     r, g, b = hex_color[0:2], hex_color[2:4], hex_color[4:6]
     return f"&H{alpha}{b}{g}{r}&".upper()
 
+
+def hex_to_ffmpeg_color(hex_color: str) -> str:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "000000"
+    return f"0x{hex_color}"
+
+
 def auto_outline_color(text_color_hex: str) -> str:
+    """Tự động chọn màu viền chữ (đen hoặc trắng) tương phản với màu chữ đã chọn,
+    để phụ đề luôn dễ đọc trên mọi nền video."""
     hex_color = text_color_hex.lstrip("#")
     if len(hex_color) != 6:
         return "#000000"
@@ -183,151 +253,56 @@ def auto_outline_color(text_color_hex: str) -> str:
     luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
     return "#000000" if luminance > 0.55 else "#FFFFFF"
 
-# ============================================================
-# NHẬN DIỆN VÙNG PHỤ ĐỀ TỰ ĐỘNG
-# ============================================================
 
-def detect_subtitle_region_fast(video_path: str, width: int, height: int, tmp_dir: str):
-    try:
-        dur = ffprobe_duration(video_path)
-        timestamps = [dur * 0.25, dur * 0.5, dur * 0.75]
-        frame_paths = []
-        for i, t in enumerate(timestamps):
-            p = os.path.join(tmp_dir, f"fast_det_{i}.jpg")
-            cmd = ["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", video_path, "-frames:v", "1", "-q:v", "5", p]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(p):
-                frame_paths.append(p)
+def compute_free_box(width: int, height: int, x_pct: float, y_pct: float, w_pct: float, h_pct: float):
+    """Tính vùng (x, y, w, h) theo pixel từ vị trí/kích thước TỰ DO (%)."""
+    x = int(width * x_pct / 100)
+    y = int(height * y_pct / 100)
+    w = int(width * w_pct / 100)
+    h = int(height * h_pct / 100)
+    x = max(0, min(x, width - 2))
+    y = max(0, min(y, height - 2))
+    w = max(4, min(w, width - x))
+    h = max(4, min(h, height - y))
+    return x, y, w, h
 
-        if len(frame_paths) < 2:
-            return int(width * 0.05), int(height * 0.78), int(width * 0.90), int(height * 0.16)
 
-        row_profiles = []
-        for p in frame_paths:
-            img = Image.open(p).convert("L").resize((width, height))
-            arr = np.asarray(img, dtype=np.float32)
-            edge = np.abs(np.diff(arr, axis=1))
-            edge = np.pad(edge, ((0, 0), (0, 1)))
-            row_energy = edge.sum(axis=1)
-            m = row_energy.max()
-            row_profiles.append(row_energy / m if m > 0 else row_energy)
-
-        avg_row = np.mean(row_profiles, axis=0)
-        bottom_start = int(height * 0.55)
-        bottom_zone = avg_row[bottom_start:]
-        peak_idx = int(np.argmax(bottom_zone)) + bottom_start
-        
-        y_start = max(0, peak_idx - int(height * 0.08))
-        y_end = min(height - 1, peak_idx + int(height * 0.08))
-        
-        return int(width * 0.05), int(y_start), int(width * 0.90), int(y_end - y_start)
-    except Exception:
-        return int(width * 0.05), int(height * 0.78), int(width * 0.90), int(height * 0.16)
-
-# ============================================================
-# LOGO THƯƠNG HIỆU
-# ============================================================
-
-def make_circle_logo(image_file, size: int = 120) -> str:
-    img = Image.open(image_file).convert("RGBA")
-    img = ImageOps.fit(img, (size, size), Image.Resampling.LANCZOS)
-    mask = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(mask)
-    draw.ellipse((0, 0, size, size), fill=255)
-    output = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    output.paste(img, (0, 0), mask=mask)
-    path = os.path.join(ensure_workdir(), "logo_circle.png")
-    output.save(path, "PNG")
-    return path
-
-# ============================================================
-# CƠ CHẾ SỬA LỖI AI ĐỌC PHỤ ĐỀ VÀ PHỐI ÂM KHÔNG LỖI
-# ============================================================
-
-async def generate_voice_edge(text: str, voice_info: dict, output_path: str):
-    import edge_tts
-    communicate = edge_tts.Communicate(text, voice_info["voice"], rate=voice_info["rate"], pitch=voice_info["pitch"])
-    await communicate.save(output_path)
-
-def generate_voice_gtts(text: str, output_path: str):
-    from gtts import gTTS
-    tts = gTTS(text=text, lang="vi")
-    tts.save(output_path)
-
-def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segments: list, voice_info: dict,
-                          remove_old_sub: bool, old_sub_box, logo_path: str = None, font_size: int = 22,
-                          primary_color: str = "&H00FFFFFF&", outline_color: str = "&H00000000&",
-                          bg_volume_pct: int = 15, voice_volume_pct: int = 100,
-                          alignment: int = 2, margin_v: int = 25):
-    
-    tmp_dir = ensure_workdir()
-    audio_segments_paths = []
-    
-    # Sửa lỗi mất tiếng: Đảm bảo dọn dẹp và tạo đường dẫn MP3 tạm không trùng lặp
-    for idx, seg in enumerate(segments):
-        audio_seg_path = os.path.join(tmp_dir, f"voice_segment_{idx}_{hash(seg['translated'])}.mp3")
-        text = seg["translated"]
-        
-        try:
-            if voice_info["provider"] == "edge":
-                asyncio.run(generate_voice_edge(text, voice_info, audio_seg_path))
-            else:
-                generate_voice_gtts(text, audio_seg_path)
-            
-            if os.path.exists(audio_seg_path) and os.path.getsize(audio_seg_path) > 0:
-                audio_segments_paths.append((seg["start"], audio_seg_path))
-        except Exception as tts_err:
-            st.warning(f"Bỏ qua phân đoạn thoại {idx} do lỗi đọc: {tts_err}")
-
-    if not audio_segments_paths:
-        raise RuntimeError("Không có tệp lồng tiếng AI nào được tạo thành công! Vui lòng kiểm tra lại kết nối mạng.")
-
-    # 2. Phối âm lượng thông minh tự động kết hợp kéo tay thủ công
-    filter_complex_audio = ""
-    inputs_audio_cmd = ["-i", video_path]
-    
-    for idx, (_, path) in enumerate(audio_segments_paths):
-        inputs_audio_cmd.extend(["-i", path])
-    
-    bg_vol = bg_volume_pct / 100.0
-    v_vol = voice_volume_pct / 100.0
-    
-    filter_complex_audio += f"[0:a]volume={bg_vol}[bg_audio];"
-    
-    mix_inputs = ""
-    for idx, (start_time, _) in enumerate(audio_segments_paths):
-        filter_complex_audio += f"[{idx+1}:a]adelay={int(start_time*1000)}|{int(start_time*1000)}[delay{idx}];"
-        mix_inputs += f"[delay{idx}]"
-    
-    filter_complex_audio += f"{mix_inputs}amix=inputs={len(audio_segments_paths)}:dropout_transition=0,volume={v_vol}[dub_audio];"
-    filter_complex_audio += f"[bg_audio][dub_audio]amix=inputs=2:duration=first[out_audio]"
-
-    temp_audio_mixed = os.path.join(tmp_dir, "audio_mixed.mp3")
-    cmd_audio = ["ffmpeg", "-y"] + inputs_audio_cmd + ["-filter_complex", filter_complex_audio, "-map", "[out_audio]", "-threads", str(CPU_COUNT), temp_audio_mixed]
-    _run_ffmpeg(cmd_audio, label="hòa trộn nhạc nền và giọng AI lồng tiếng")
-
-    # 3. Tạo bộ lọc hình ảnh (Xóa phụ đề cũ + Vị trí phụ đề mới)
+def process_video(video_path: str, output_path: str, *,
+                   remove_old_sub: bool = False, old_sub_method: str = "blur",
+                   old_sub_box=None, old_sub_color: str = "0x000000", blur_strength: int = 25,
+                   burn_new_sub: bool = False, srt_path: str = None,
+                   font_size: int = 20, primary_color: str = "&H00FFFFFF&",
+                   outline_color: str = "&H00000000&", alignment: int = 2, margin_v: int = 25,
+                   video_preset: str = "veryfast"):
+    """Gộp bước xóa phụ đề gốc + ghi phụ đề mới vào MỘT lần encode video duy nhất."""
     filters = []
     stage = "[0:v]"
     counter = 0
 
     if remove_old_sub and old_sub_box:
         x, y, w, h = old_sub_box
-        filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
-        filters.append(
-            f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
-            f"boxblur=luma_radius=20:luma_power=1:chroma_radius=10:chroma_power=1[vblur{counter}]"
-        )
-        filters.append(f"[vmain{counter}][vblur{counter}]overlay={x}:{y}[v{counter}]")
+        if old_sub_method == "blur":
+            # ffmpeg giới hạn bán kính làm mờ kênh màu (chroma_radius) phải < 18,
+            # trong khi kênh sáng (luma_radius) có thể lớn hơn — nếu dùng chung 1
+            # giá trị cho cả hai (như "boxblur=25:2") sẽ bị lỗi khi > 17. Tách
+            # riêng và luôn kẹp chroma trong giới hạn hợp lệ.
+            luma_radius = max(1, min(int(blur_strength), 40))
+            chroma_radius = max(1, min(luma_radius, 17))
+            filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
+            filters.append(
+                f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
+                f"boxblur=luma_radius={luma_radius}:luma_power=2:"
+                f"chroma_radius={chroma_radius}:chroma_power=2[vblur{counter}]"
+            )
+            filters.append(f"[vmain{counter}][vblur{counter}]overlay={x}:{y}[v{counter}]")
+        elif old_sub_method == "delogo":
+            filters.append(f"{stage}delogo=x={x}:y={y}:w={w}:h={h}:show=0[v{counter}]")
+        else:  # solid
+            filters.append(f"{stage}drawbox=x={x}:y={y}:w={w}:h={h}:color={old_sub_color}@1:t=fill[v{counter}]")
         stage = f"[v{counter}]"
         counter += 1
 
-    if logo_path and os.path.exists(logo_path):
-        logo_input_idx = 1
-        filters.append(f"{stage}[{logo_input_idx}:v]overlay=x=20:y=20[vlogo]")
-        stage = "[vlogo]"
-
-    if srt_path:
+    if burn_new_sub and srt_path:
         srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
         style = (
             f"FontName=Arial,FontSize={font_size},PrimaryColour={primary_color},"
@@ -337,285 +312,905 @@ def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segm
         filters.append(f"{stage}subtitles={srt_escaped}:force_style='{style}'[vout]")
         stage = "[vout]"
 
+    # libx264 yêu cầu chiều rộng/cao là số chẵn — nhiều video gốc có kích thước
+    # lẻ (vd 1919x1079) sẽ làm ffmpeg lỗi ngay lập tức nếu không ép về số chẵn.
     filters.append(f"{stage}scale=trunc(iw/2)*2:trunc(ih/2)*2[veven]")
     stage = "[veven]"
 
-    filter_complex_video = ";".join(filters)
+    filter_complex = ";".join(filters)
 
-    cmd_video = ["ffmpeg", "-y", "-i", video_path]
-    if logo_path and os.path.exists(logo_path):
-        cmd_video.extend(["-i", logo_path])
-        
-    cmd_video.extend([
-        "-i", temp_audio_mixed,
-        "-filter_complex", filter_complex_video,
-        "-map", stage,
-        "-map", f"{2 if logo_path else 1}:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-filter_complex", filter_complex,
+        "-map", stage, "-map", "0:a?",
+        "-c:v", "libx264", "-preset", video_preset, "-crf", "20",
         "-threads", "0",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path
-    ])
-    _run_ffmpeg(cmd_video, label="ghép xuất video thành phẩm tốc độ cao")
+        "-c:a", "copy",
+        output_path,
+    ]
+    _run_ffmpeg(cmd, label="xử lý hình ảnh video (xoá phụ đề gốc / ghi phụ đề mới)")
+
+
+def adjust_video_volume(video_path: str, output_path: str, volume_factor: float):
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-filter:a", f"volume={volume_factor}",
+        "-c:v", "copy",
+        output_path,
+    ]
+    _run_ffmpeg(cmd, label="điều chỉnh âm lượng gốc")
+
 
 # ============================================================
-# CÁC HÀM XEM TRƯỚC (PREVIEW)
+# TỰ ĐỘNG PHÁT HIỆN VÙNG PHỤ ĐỀ GỐC (không cần OpenCV, chỉ dùng Pillow + numpy)
+# ============================================================
+#
+# Ý tưởng: phụ đề chữ Trung ghi cứng trên video luôn nằm ở CÙNG một vùng
+# (thường là dải ngang gần đáy khung hình) trong suốt video, dù nội dung chữ
+# đổi liên tục. Vì vậy, nếu lấy mẫu nhiều khung hình rải đều theo thời lượng
+# video, tính "năng lượng cạnh" (edge energy - đo độ tương phản/viền chữ)
+# theo từng hàng/cột pixel rồi lấy trung bình qua tất cả khung hình mẫu, thì
+# vùng có phụ đề sẽ luôn nổi bật hơn hẳn phần còn lại (vì có viền chữ rõ nét
+# lặp lại đúng vị trí), trong khi nội dung video thường trôi/thay đổi vị trí
+# edge liên tục nên không tích luỹ năng lượng rõ rệt tại một dải cố định.
+
+def _extract_sample_frames(video_path: str, out_dir: str, count: int = 10):
+    try:
+        dur = ffprobe_duration(video_path)
+    except Exception:
+        return []
+    if dur <= 0.5:
+        return []
+    if count > 1:
+        timestamps = [dur * (0.08 + 0.84 * i / (count - 1)) for i in range(count)]
+    else:
+        timestamps = [dur * 0.5]
+
+    paths = []
+    for i, t in enumerate(timestamps):
+        p = os.path.join(out_dir, f"det_frame_{i}.jpg")
+        try:
+            cmd = ["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", video_path, "-frames:v", "1", "-q:v", "3", p]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(p):
+                paths.append(p)
+        except Exception:
+            pass
+    return paths
+
+
+def _edge_energy_map(gray_arr: "np.ndarray") -> "np.ndarray":
+    gx = np.abs(np.diff(gray_arr, axis=1))
+    gy = np.abs(np.diff(gray_arr, axis=0))
+    gx = np.pad(gx, ((0, 0), (0, 1)))
+    gy = np.pad(gy, ((0, 1), (0, 0)))
+    return gx + gy
+
+
+def _default_subtitle_box(width: int, height: int):
+    """Vùng mặc định dùng khi không phát hiện được vị trí rõ ràng — dải dưới
+    cùng khung hình, nơi phụ đề Trung thường được đặt."""
+    x = int(width * 0.05)
+    y = int(height * 0.80)
+    w = int(width * 0.90)
+    h = int(height * 0.14)
+    return x, y, w, h
+
+
+def detect_subtitle_region(video_path: str, width: int, height: int, tmp_dir: str, sample_count: int = 10):
+    """Trả về (x, y, w, h) theo pixel là vùng nhiều khả năng chứa phụ đề gốc
+    ghi cứng trên video. Nếu không chắc chắn, trả về vùng mặc định an toàn ở
+    dưới khung hình (dùng blur nên kể cả đoán chưa hoàn hảo cũng không phá
+    hỏng hình ảnh)."""
+    try:
+        frame_paths = _extract_sample_frames(video_path, tmp_dir, count=sample_count)
+        if len(frame_paths) < 3:
+            return _default_subtitle_box(width, height)
+
+        row_profiles = []
+        edge_maps = []
+        for p in frame_paths:
+            img = Image.open(p).convert("L")
+            if img.size != (width, height):
+                img = img.resize((width, height))
+            arr = np.asarray(img, dtype=np.float32)
+            edge = _edge_energy_map(arr)
+            edge_maps.append(edge)
+            row_energy = edge.sum(axis=1)
+            m = row_energy.max()
+            row_profiles.append(row_energy / m if m > 0 else row_energy)
+
+        avg_row = np.mean(row_profiles, axis=0)
+
+        bottom_start = int(height * 0.45)
+        top_end = int(height * 0.22)
+        bottom_zone = avg_row[bottom_start:]
+        top_zone = avg_row[:top_end]
+
+        bottom_peak = float(bottom_zone.max()) if len(bottom_zone) else 0.0
+        top_peak = float(top_zone.max()) if len(top_zone) else 0.0
+
+        if bottom_peak <= 0.05 and top_peak <= 0.05:
+            return _default_subtitle_box(width, height)
+
+        if bottom_peak >= top_peak:
+            zone_offset, zone, peak = bottom_start, bottom_zone, bottom_peak
+        else:
+            zone_offset, zone, peak = 0, top_zone, top_peak
+
+        peak_idx = int(np.argmax(zone)) + zone_offset
+        threshold = peak * 0.4
+
+        y_start = peak_idx
+        while y_start > 0 and avg_row[y_start - 1] >= threshold:
+            y_start -= 1
+        y_end = peak_idx
+        while y_end < height - 1 and avg_row[y_end + 1] >= threshold:
+            y_end += 1
+
+        min_h, max_h = int(height * 0.04), int(height * 0.22)
+        if (y_end - y_start) < min_h:
+            pad = (min_h - (y_end - y_start)) // 2 + 1
+            y_start, y_end = max(0, y_start - pad), min(height - 1, y_end + pad)
+        if (y_end - y_start) > max_h:
+            center = (y_start + y_end) // 2
+            y_start, y_end = max(0, center - max_h // 2), min(height - 1, center + max_h // 2)
+
+        col_profiles = []
+        for edge in edge_maps:
+            band = edge[y_start:y_end + 1, :]
+            col_energy = band.sum(axis=0)
+            m = col_energy.max()
+            col_profiles.append(col_energy / m if m > 0 else col_energy)
+        avg_col = np.mean(col_profiles, axis=0)
+        col_peak = float(avg_col.max())
+        col_threshold = col_peak * 0.25
+
+        idx = np.where(avg_col >= col_threshold)[0]
+        if len(idx) == 0:
+            x_start, x_end = int(width * 0.05), int(width * 0.95)
+        else:
+            x_start, x_end = int(idx.min()), int(idx.max())
+
+        pad_x, pad_y = int(width * 0.02), int(height * 0.015)
+        x_start, x_end = max(0, x_start - pad_x), min(width - 1, x_end + pad_x)
+        y_start, y_end = max(0, y_start - pad_y), min(height - 1, y_end + pad_y)
+
+        x, y, w, h = x_start, y_start, (x_end - x_start), (y_end - y_start)
+        if w < width * 0.15 or h < height * 0.03:
+            return _default_subtitle_box(width, height)
+        return (x, y, w, h)
+    except Exception:
+        return _default_subtitle_box(width, height)
+
+
+# ============================================================
+# TẢI VIDEO TRỰC TIẾP TỪ LINK DOUYIN (không cần tự tải xuống máy rồi upload lại)
+# ============================================================
+
+class VideoDownloadError(RuntimeError):
+    pass
+
+
+def download_video_from_url(url: str, out_dir: str, progress_cb=None):
+    """Dùng yt-dlp để tải video từ link Douyin (hoặc các link video khác mà
+    yt-dlp hỗ trợ) về out_dir. Trả về (đường_dẫn_file, tiêu_đề)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        raise VideoDownloadError(
+            "Chưa cài thư viện yt-dlp. Chạy: pip install yt-dlp --break-system-packages"
+        )
+
+    out_template = os.path.join(out_dir, "douyin_%(id)s.%(ext)s")
+
+    def hook(d):
+        if progress_cb and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            if total:
+                progress_cb(min(downloaded / total, 1.0))
+
+    ydl_opts = {
+        "outtmpl": out_template,
+        "format": "bv*+ba/best/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "progress_hooks": [hook] if progress_cb else [],
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base, _ = os.path.splitext(filepath)
+                for alt_ext in (".mp4", ".mkv", ".webm"):
+                    candidate = base + alt_ext
+                    if os.path.exists(candidate):
+                        filepath = candidate
+                        break
+            title = (info.get("title") or "video_douyin").strip()
+    except Exception as e:
+        raise VideoDownloadError(
+            f"Không tải được video từ link này. Có thể do: link sai/riêng tư/đã bị gỡ, "
+            f"video bị chặn khu vực, hoặc Douyin đã đổi cách bảo vệ link.\n\nChi tiết: {e}"
+        )
+
+    if not filepath or not os.path.exists(filepath):
+        raise VideoDownloadError("Tải xong nhưng không tìm thấy file video kết quả.")
+
+    return filepath, title
+
+
+# ============================================================
+# CÁC HÀM XEM TRƯỚC (PREVIEW) — chỉ thao tác trên 1 khung hình mẫu, cực nhanh
 # ============================================================
 
 def ensure_workdir() -> str:
     if "workdir" not in st.session_state:
-        st.session_state.workdir = tempfile.mkdtemp(prefix="vidtrans_fast_")
+        st.session_state.workdir = tempfile.mkdtemp(prefix="vidtrans_")
     return st.session_state.workdir
 
+
 def get_persistent_video_path(uploaded_file) -> str:
+    """Lưu file upload vào thư mục tạm bền vững (giữ được qua các lần Streamlit tự
+    rerun khi kéo thanh trượt) để tạo ảnh xem trước ngay lập tức."""
     ensure_workdir()
+
     file_hash = hashlib.md5(uploaded_file.getbuffer()).hexdigest()[:10]
     ext = os.path.splitext(uploaded_file.name)[1] or ".mp4"
     path = os.path.join(st.session_state.workdir, f"src_{file_hash}{ext}")
+
     if not os.path.exists(path):
+        for old in os.listdir(st.session_state.workdir):
+            if old.startswith("src_") and old != os.path.basename(path):
+                try:
+                    os.remove(os.path.join(st.session_state.workdir, old))
+                except OSError:
+                    pass
         with open(path, "wb") as f:
             f.write(uploaded_file.getbuffer())
     return path
 
-def extract_preview_frame(video_path: str, frame_path: str) -> bool:
+
+def extract_preview_frame(video_path: str, out_path: str):
     try:
-        cmd = ["ffmpeg", "-y", "-ss", "00:00:03", "-i", video_path, "-vframes", "1", "-q:v", "2", frame_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return os.path.exists(frame_path)
+        dur = ffprobe_duration(video_path)
+        timestamp = max(min(dur * 0.3, dur - 0.1), 0) if dur > 0.2 else 0
     except Exception:
-        try:
-            cmd = ["ffmpeg", "-y", "-ss", "00:00:00", "-i", video_path, "-vframes", "1", "-q:v", "2", frame_path]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return os.path.exists(frame_path)
-        except Exception:
-            return False
+        timestamp = 0
+    cmd = ["ffmpeg", "-y", "-ss", f"{timestamp:.2f}", "-i", video_path,
+           "-frames:v", "1", "-q:v", "2", out_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def ensure_preview_frame(video_path: str):
     if st.session_state.get("preview_frame_for") == video_path and st.session_state.get("preview_frame_path"):
         return st.session_state.preview_frame_path, st.session_state.preview_video_res
 
     frame_path = os.path.join(st.session_state.workdir, "preview_frame.jpg")
-    ok = extract_preview_frame(video_path, frame_path)
-    if ok:
-        try:
-            resolution = get_video_resolution(video_path)
-        except Exception:
-            resolution = None
+    try:
+        extract_preview_frame(video_path, frame_path)
+        resolution = get_video_resolution(video_path)
         st.session_state.preview_frame_for = video_path
         st.session_state.preview_frame_path = frame_path
         st.session_state.preview_video_res = resolution
         return frame_path, resolution
-    return None, None
-
-def render_preview_with_box(frame_path: str, box, logo_path: str = None, font_size: int = 24, text_color: str = "#FFFFFF", alignment: int = 2, margin_v: int = 25) -> "Image.Image":
-    img = Image.open(frame_path)
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-    
-    if box:
-        x, y, bw, bh = box
-        draw.rectangle([x, y, x + bw, y + bh], outline="#FF3333", width=4)
-        draw.text((x + 10, max(0, y - 25)), "VÙNG LÀM MỜ (XÓA SUB GỐC)", fill="#FF3333")
-        
-    if logo_path and os.path.exists(logo_path):
-        logo_img = Image.open(logo_path).convert("RGBA")
-        preview_logo_size = max(int(h * 0.12), 45)
-        logo_img = logo_img.resize((preview_logo_size, preview_logo_size))
-        img.paste(logo_img, (20, 20), mask=logo_img)
-        draw.text((20, 25 + preview_logo_size), "LOGO", fill="#00FF00")
-        
-    try:
-        sample_text = "Phụ đề mẫu tiếng Việt"
-        y_pos = h - margin_v - font_size
-        
-        if alignment == 1:
-            x_pos = int(w * 0.05)
-        elif alignment == 3:
-            x_pos = int(w * 0.95) - 200
-        else:
-            x_pos = (w - 200) // 2
-            
-        draw.rectangle([x_pos - 5, y_pos - 2, x_pos + 205, y_pos + font_size + 2], fill="#00000099")
-        draw.text((x_pos, y_pos), sample_text, fill=text_color)
     except Exception:
-        pass
-        
+        st.session_state.preview_frame_for = video_path
+        st.session_state.preview_frame_path = None
+        st.session_state.preview_video_res = None
+        return None, None
+
+
+def ensure_detected_box(video_path: str, width: int, height: int):
+    """Chạy phát hiện vùng phụ đề gốc 1 lần cho mỗi video, cache lại trong session_state."""
+    if st.session_state.get("detected_box_for") == video_path and st.session_state.get("detected_box"):
+        return st.session_state.detected_box
+    box = detect_subtitle_region(video_path, width, height, st.session_state.workdir)
+    st.session_state.detected_box_for = video_path
+    st.session_state.detected_box = box
+    return box
+
+
+def _load_preview_font(size: int):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def render_subtitle_style_preview(base_image: "Image.Image", sample_text: str, font_size: int,
+                                   text_color_hex: str, outline_color_hex: str,
+                                   alignment: int, margin_v: int) -> "Image.Image":
+    img = base_image.copy()
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+
+    scaled_font_size = max(int(font_size * (h / 360)), 10)
+    font = _load_preview_font(scaled_font_size)
+
+    bbox = draw.textbbox((0, 0), sample_text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    x = (w - text_w) / 2
+    scaled_margin = int(margin_v * (h / 360))
+    if alignment == 8:  # trên
+        y = scaled_margin
+    elif alignment == 5:  # giữa màn hình
+        y = (h - text_h) / 2
+    else:  # dưới (mặc định)
+        y = h - text_h - scaled_margin - h * 0.02
+
+    outline_w = max(scaled_font_size // 12, 1)
+    draw.text((x, y), sample_text, font=font, fill=text_color_hex,
+              stroke_width=outline_w, stroke_fill=outline_color_hex)
     return img
 
+
+def render_old_sub_box_preview(base_image: "Image.Image", box, method: str,
+                                color_hex: str, blur_strength: int) -> "Image.Image":
+    img = base_image.copy()
+    if not box:
+        return img
+    x, y, w, h = box
+    x2, y2 = x + w, y + h
+
+    if method == "blur":
+        region = img.crop((x, y, x2, y2)).filter(ImageFilter.GaussianBlur(max(blur_strength / 4, 1)))
+        img.paste(region, (x, y))
+    elif method == "delogo":
+        region = img.crop((x, y, x2, y2)).filter(ImageFilter.GaussianBlur(max(blur_strength / 6, 1)))
+        img.paste(region, (x, y))
+    else:  # solid
+        overlay = Image.new("RGB", (w, h), color_hex)
+        img.paste(overlay, (x, y))
+
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([x, y, x2 - 1, y2 - 1], outline="#FF3B30", width=max(int(h * 0.06), 2))
+    return img
+
+
+def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, out_path: str,
+                                sample_text: str = SAMPLE_TTS_TEXT):
+    import edge_tts
+    communicate = edge_tts.Communicate(sample_text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+    _run_async(communicate.save(out_path))
+
+
 # ============================================================
-# GIAO DIỆN CHÍNH TRỰC QUAN MÀU SẮC (UI)
+# CÁC HÀM LỒNG TIẾNG (TTS)
 # ============================================================
 
-st.markdown("<h1 class='main-title'>⚡ Dịch & Lồng Tiếng Thông Minh</h1>", unsafe_allow_html=True)
-st.caption("<p style='text-align: center; color: #64748b; font-size: 1.05rem;'>Giao diện tối giản mới dễ dùng • Sửa triệt để lỗi mất giọng đọc lồng tiếng • Tự động & Thủ công song hành</p>", unsafe_allow_html=True)
-st.write("---")
+def _run_async(coro):
+    try:
+        asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
-uploaded_file = st.file_uploader("📂 Hãy kéo thả hoặc chọn video của bạn tại đây:", type=["mp4", "mkv", "mov", "avi"])
 
-if uploaded_file:
-    video_path = get_persistent_video_path(uploaded_file)
-    frame_path, resolution = ensure_preview_frame(video_path)
-    
-    if frame_path and resolution:
-        width, height = resolution
-        
-        if "box_x" not in st.session_state:
-            def_x, def_y, def_w, def_h = detect_subtitle_region_fast(video_path, width, height, st.session_state.workdir)
-            st.session_state.box_x = def_x
-            st.session_state.box_y = def_y
-            st.session_state.box_w = def_w
-            st.session_state.box_h = def_h
+def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
+                        max_retries: int = 3, concurrency: int = 6, progress_cb=None):
+    import edge_tts
 
-        # Chia màn hình làm 2 khu vực ngang rất dễ quan sát
-        col_ctrl, col_preview = st.columns([1, 1])
-        
-        with col_ctrl:
-            st.subheader("🛠️ Cài đặt Video & Âm thanh")
-            
-            # --- KHỐI ĐIỀU CHỈNH ÂM LƯỢNG (TỰ ĐỘNG & THỦ CÔNG) ---
-            st.markdown("<div class='section-audio'>🔊 <b>ĐIỀU CHỈNH ÂM LƯỢNG</b></div>", unsafe_allow_html=True)
-            auto_volume = st.checkbox("⚙️ Chế độ tự động tối ưu hóa âm lượng", value=True)
-            
-            if not auto_volume:
-                bg_vol = st.slider("📁 Âm lượng video gốc (Nhạc nền):", 0, 100, 15, format="%d%%")
-                voice_vol = st.slider("🎙️ Âm lượng lồng tiếng AI:", 0, 200, 100, format="%d%%")
-            else:
-                bg_vol = 15
-                voice_vol = 100
-                st.info("🎯 *Đang tự động: Hạ nhạc nền gốc xuống 15%, Đẩy giọng AI lồng tiếng lên 100%*")
-                
-            # --- KHỐI VỊ TRÍ PHỤ ĐỀ MỚI ---
-            st.markdown("<div class='section-auto'>📝 <b>VỊ TRÍ PHỤ ĐỀ MỚI</b></div>", unsafe_allow_html=True)
-            auto_sub_pos = st.checkbox("⚙️ Chế độ tự động căn giữa chân màn hình", value=True)
-            
-            if not auto_sub_pos:
-                align_option = st.selectbox("Lề phụ đề mới:", ["Căn giữa (Center)", "Căn trái (Left)", "Căn phải (Right)"])
-                alignment_map = {"Căn trái (Left)": 1, "Căn giữa (Center)": 2, "Căn phải (Right)": 3}
-                sub_alignment = alignment_map[align_option]
-                sub_margin_v = st.slider("Chỉnh khoảng cách lề đáy (px):", 5, int(height * 0.4), 25)
-            else:
-                sub_alignment = 2
-                sub_margin_v = 25
-                st.info("🎯 *Đang tự động: Phụ đề mới xuất hiện chính giữa cách đáy 25px*")
+    failed_indices = set()
+    done_count = 0
+    lock = asyncio.Lock()
 
-            # --- KHỐI KHUNG XÓA SUB CŨ ---
-            st.markdown("<div class='section-manual'>🖼️ <b>KÍCH THƯỚC KHUNG XÓA SUB</b></div>", unsafe_allow_html=True)
-            remove_old_sub = st.checkbox("Bật bộ lọc xóa phụ đề tiếng Trung gốc", value=True)
-            
-            if remove_old_sub:
-                auto_box = st.checkbox("⚙️ Tự động quét vùng chữ tiếng Trung", value=True)
-                if not auto_box:
-                    bx = st.slider("Tọa độ ngang X:", 0, width, st.session_state.box_x)
-                    by = st.slider("Tọa độ dọc Y:", 0, height, st.session_state.box_y)
-                    bw = st.slider("Chiều rộng khung xóa (Width):", 10, width - bx, st.session_state.box_w)
-                    bh = st.slider("Chiều cao khung xóa (Height):", 10, height - by, st.session_state.box_h)
-                    
-                    st.session_state.box_x = bx
-                    st.session_state.box_y = by
-                    st.session_state.box_w = bw
-                    st.session_state.box_h = bh
-                    current_box = (bx, by, bw, bh)
-                else:
-                    current_box = (st.session_state.box_x, st.session_state.box_y, st.session_state.box_w, st.session_state.box_h)
-                    st.info("🎯 *Đang sử dụng tọa độ tự động quét bởi thuật toán AI*")
-            else:
-                current_box = None
-                
-            st.write("")
-            logo_file = st.file_uploader("In logo góc trái trên màn hình (nếu có):", type=["png", "jpg", "jpeg"])
-            logo_path = None
-            if logo_file:
-                logo_target_size = max(int(height * 0.12), 60)
-                logo_path = make_circle_logo(logo_file, size=logo_target_size)
-                st.success("Logo đã được nén tròn thành công!")
-                
-            st.write("")
-            voice_labels = [v["label"] for v in VOICE_CATALOG]
-            selected_voice_label = st.selectbox("Chọn giọng đọc lồng tiếng Việt:", voice_labels)
-            selected_voice = next(v for v in VOICE_CATALOG if v["label"] == selected_voice_label)
+    async def _synthesize_one(sem, idx, text, raw_path):
+        nonlocal done_count
+        async with sem:
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+                    await communicate.save(raw_path)
+                    if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                        success = True
+                        break
+                except Exception:
+                    await asyncio.sleep(0.6)
+            if not success:
+                failed_indices.add(idx)
+        async with lock:
+            done_count += 1
+            if progress_cb:
+                progress_cb(done_count, len(items))
 
-        with col_preview:
-            st.subheader("📺 Khung Nhìn Thử Nghiệm (Preview)")
-            
-            font_size = st.slider("Điều chỉnh kích cỡ chữ phụ đề (px):", 12, 60, 24)
-            text_color = st.color_picker("Tự chọn màu chữ mới:", "#FFFFFF")
-            outline_color = auto_outline_color(text_color)
-            
-            preview_img = render_preview_with_box(
-                frame_path, 
-                current_box if remove_old_sub else None, 
-                logo_path,
-                font_size=font_size,
-                text_color=text_color,
-                alignment=sub_alignment,
-                margin_v=sub_margin_v
+    async def _synthesize_all():
+        sem = asyncio.Semaphore(concurrency)
+        await asyncio.gather(*[_synthesize_one(sem, idx, text, raw_path) for idx, text, raw_path in items])
+
+    _run_async(_synthesize_all())
+    return failed_indices
+
+
+def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
+    dur = ffprobe_duration(in_path)
+    if dur <= target_duration or target_duration <= 0:
+        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    factor = dur / target_duration
+    filters = []
+    remaining = factor
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.3f}")
+    subprocess.run(["ffmpeg", "-y", "-i", in_path, "-filter:a", ",".join(filters), "-ar", "24000", "-ac", "1", out_path],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def make_silence(out_path: str, duration: float):
+    duration = max(duration, 0.1)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={duration}", out_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
+                     tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None):
+    items = []
+    for i, seg in enumerate(segments):
+        text = seg["translated"].strip()
+        if text:
+            raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
+            items.append((i, text, raw_path))
+
+    failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch,
+                                         concurrency=concurrency, progress_cb=progress_cb)
+
+    seg_files = []
+    for idx, text, raw_path in items:
+        seg = segments[idx]
+        slot_duration = max(seg["end"] - seg["start"], 0.3)
+        fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
+        if idx in failed_indices:
+            make_silence(fit_path, slot_duration)
+        else:
+            fit_audio_to_duration(raw_path, fit_path, slot_duration)
+        seg_files.append((seg["start"], fit_path))
+
+    dub_track_path = os.path.join(tmp_dir, "dub_track.wav")
+    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={total_duration}"]
+    filter_parts = []
+    amix_labels = ["[0:a]"]
+    for idx, (start, path) in enumerate(seg_files):
+        inputs += ["-i", path]
+        delay_ms = int(start * 1000)
+        filter_parts.append(f"[{idx + 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+        amix_labels.append(f"[a{idx}]")
+
+    filter_complex = ";".join(filter_parts)
+    if filter_complex:
+        filter_complex += ";"
+    filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
+
+    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
+    _run_ffmpeg(cmd, label="ghép các đoạn giọng đọc AI thành 1 track")
+    return dub_track_path, failed_indices
+
+
+def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str,
+                            keep_bg: bool, bg_volume: float = 0.08):
+    if keep_bg:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
+            "-filter_complex", f"[0:a]volume={bg_volume}[bg];[1:a]anull[dub];[bg][dub]amix=inputs=2:duration=first:normalize=0[aout]",
+            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-shortest", output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-shortest", output_path,
+        ]
+    _run_ffmpeg(cmd, label="ghép giọng lồng tiếng AI vào video")
+
+
+# ============================================================
+# GIAO DIỆN
+# ============================================================
+
+st.title("🎬 Dịch & lồng tiếng video Trung → Việt")
+st.caption(
+    "Chỉ cần tải video lên, chọn cỡ chữ, giọng đọc và màu chữ — mọi bước còn lại "
+    "(phát hiện & xoá phụ đề gốc, lồng tiếng AI, chỉnh âm lượng...) được xử lý tự động."
+)
+
+# ---------- 1) TẢI VIDEO ----------
+st.subheader("📥 Nguồn video")
+video_source_mode = st.radio(
+    "Chọn cách đưa video vào",
+    ["📤 Tải file từ máy", "🔗 Dán link Douyin (tự động tải về)"],
+    horizontal=True, label_visibility="collapsed",
+)
+
+active_video_path = None
+active_video_name = None
+
+if video_source_mode.startswith("📤"):
+    uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
+    if uploaded_file is not None:
+        active_video_path = get_persistent_video_path(uploaded_file)
+        active_video_name = uploaded_file.name
+else:
+    douyin_url = st.text_input(
+        "🔗 Dán link video Douyin vào đây",
+        placeholder="https://www.douyin.com/video/... hoặc link chia sẻ dạng v.douyin.com/...",
+    )
+    dl_col1, dl_col2 = st.columns([1, 3])
+    with dl_col1:
+        do_download = st.button("⬇️ Tải video về", disabled=not douyin_url.strip())
+
+    if do_download and douyin_url.strip():
+        ensure_workdir()
+        dl_progress = st.progress(0.0, text="Đang tải video từ Douyin...")
+        try:
+            dl_path, dl_title = download_video_from_url(
+                douyin_url.strip(), st.session_state.workdir,
+                progress_cb=lambda p: dl_progress.progress(p, text=f"Đang tải video từ Douyin... {int(p * 100)}%"),
             )
-            st.image(preview_img, use_container_width=True, caption="Ảnh mô phỏng tọa độ xóa phụ đề và vị trí chữ")
+            dl_progress.progress(1.0, text="Tải xong!")
+            st.session_state.douyin_video_path = dl_path
+            st.session_state.douyin_video_name = (dl_title or "video_douyin") + os.path.splitext(dl_path)[1]
+            st.session_state.douyin_source_url = douyin_url.strip()
+            st.success(f"✅ Đã tải xong: {dl_title}")
+        except VideoDownloadError as e:
+            st.error(f"❌ {e}")
+            st.session_state.douyin_video_path = None
 
-        if st.button("🚀 BẮT ĐẦU XỬ LÝ VIDEO NGAY", type="primary"):
-            st.write("---")
-            progress_area = st.empty()
-            
-            tmp_dir = ensure_workdir()
-            audio_path = os.path.join(tmp_dir, "extracted_mono.wav")
-            out_srt = os.path.join(tmp_dir, "subtitles.srt")
-            out_video = os.path.join(tmp_dir, "output_final.mp4")
-            
-            # Tiến trình 1
-            progress_area.info("⏳ Đang bóc tách nhạc nền gốc...")
-            extract_audio(video_path, audio_path)
-            
-            # Tiến trình 2
-            progress_area.info("⏳ Đang quét nhận diện chữ tiếng Trung bằng Whisper...")
-            try:
-                raw_segments = transcribe_audio(audio_path, "base", beam_size=1)
-            except Exception as e:
-                st.error(f"Lỗi nhận dạng: {e}")
+    if st.session_state.get("douyin_video_path") and os.path.exists(st.session_state.douyin_video_path):
+        active_video_path = st.session_state.douyin_video_path
+        active_video_name = st.session_state.get("douyin_video_name", "video_douyin.mp4")
+        st.caption(f"🎬 Video đang dùng: **{active_video_name}**")
+
+preview_frame_path = None
+preview_video_res = None
+detected_box = None
+
+if active_video_path is not None:
+    persistent_video_path = active_video_path
+    with st.spinner("Đang chuẩn bị khung hình xem trước..."):
+        preview_frame_path, preview_video_res = ensure_preview_frame(persistent_video_path)
+    if preview_frame_path is None:
+        st.warning("⚠️ Không trích được khung hình xem trước (file có thể lỗi) — vẫn xử lý được nhưng sẽ không có ảnh xem trước.")
+    else:
+        pw, ph = preview_video_res
+        with st.spinner("🔎 Đang tự động phát hiện vùng phụ đề gốc..."):
+            detected_box = ensure_detected_box(persistent_video_path, pw, ph)
+else:
+    st.info("👆 Hãy tải video lên hoặc dán link Douyin để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
+
+pw, ph = preview_video_res if preview_video_res else (None, None)
+
+# Gợi ý cỡ chữ mặc định theo độ phân giải video (người dùng vẫn chỉnh được)
+default_font_size = 20
+if ph:
+    default_font_size = max(14, min(48, int(ph / 18)))
+
+# ---------- 2) 3 THÔNG SỐ NGƯỜI DÙNG CẦN CHỌN ----------
+st.divider()
+st.subheader("🎛️ Chỉ 3 điều bạn cần chọn")
+
+c1, c2 = st.columns(2)
+with c1:
+    font_size = st.slider("🔤 Cỡ chữ phụ đề", 10, 60, default_font_size, step=1)
+with c2:
+    text_color = st.color_picker("🎨 Màu chữ phụ đề", "#FFFFFF")
+
+voice_style_label = st.selectbox("🎙️ Giọng đọc lồng tiếng AI", list(VOICE_STYLE_OPTIONS.keys()))
+voice_style = VOICE_STYLE_OPTIONS[voice_style_label]
+
+# Các giá trị tự động suy ra từ 3 lựa chọn trên
+outline_color = auto_outline_color(text_color)
+
+# ---------- 3) TUỲ CHỈNH NÂNG CAO (KHÔNG BẮT BUỘC) ----------
+with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc — để trống thì mọi thứ đã tự động tối ưu)"):
+    st.caption("Chỉ mở phần này nếu bạn muốn tự tay ghi đè lên các lựa chọn tự động.")
+
+    adv_burn_sub = st.checkbox("Ghi phụ đề chữ lên video", value=True)
+    adv_bilingual = st.checkbox("Hiện song ngữ (Trung + Việt) trong file .srt", value=False)
+    adv_position_label = st.selectbox("Vị trí phụ đề mới", list(POSITION_OPTIONS.keys()), index=0)
+    adv_margin_v = st.slider("Cách mép (px)", 0, 150, int(25 * ((ph or 360) / 360)), step=5)
+
+    st.markdown("---")
+    adv_manual_old_box = st.checkbox("Tự chỉnh tay vùng che phụ đề gốc (thay vì để tự động phát hiện)", value=False)
+    adv_disable_remove_old = st.checkbox("KHÔNG xoá/che phụ đề gốc", value=False)
+    adv_old_method_label = st.selectbox(
+        "Cách che phụ đề gốc",
+        ["Làm mờ (blur) - mặc định tự động", "Che bằng khung màu đặc", "Làm mượt tự nhiên (delogo)"],
+        index=0,
+    )
+    if "delogo" in adv_old_method_label:
+        adv_old_method_key = "delogo"
+    elif "khung màu" in adv_old_method_label:
+        adv_old_method_key = "solid"
+    else:
+        adv_old_method_key = "blur"
+
+    manual_box_pct = None
+    if adv_manual_old_box:
+        mcol1, mcol2, mcol3 = st.columns(3)
+        with mcol1:
+            st.caption("⬆️ Trên / ⏺️ Giữa / ⬇️ Dưới")
+        old_x_pct = st.slider("Vị trí ngang (%)", 0, 100, 5, step=1, key="adv_old_x_pct")
+        old_y_pct = st.slider("Vị trí dọc (%)", 0, 100, 80, step=1, key="adv_old_y_pct")
+        old_w_pct = st.slider("Chiều rộng vùng che (%)", 4, 100, 90, step=1, key="adv_old_w_pct")
+        old_h_pct = st.slider("Chiều cao vùng che (%)", 3, 60, 14, step=1, key="adv_old_h_pct")
+        manual_box_pct = (old_x_pct, old_y_pct, old_w_pct, old_h_pct)
+
+    adv_box_color = st.color_picker("Màu khung che (chỉ dùng cho 'khung màu đặc')", "#000000",
+                                     disabled=adv_old_method_key != "solid")
+    adv_blur_strength = st.slider("Độ mờ (chỉ dùng cho 'làm mờ')", 5, 50, 25, disabled=adv_old_method_key != "blur")
+
+    st.markdown("---")
+    adv_disable_dub = st.checkbox("KHÔNG lồng tiếng AI (chỉ dịch phụ đề chữ)", value=False)
+    adv_keep_bg = st.checkbox("Giữ tiếng nền/nhạc nền gốc phía sau giọng đọc AI", value=True)
+    adv_override_bg_volume = st.checkbox("Tự chỉnh tay âm lượng nền gốc (thay vì để tự động ở mức thấp nhất)", value=False)
+    adv_bg_volume_pct = st.slider("Âm lượng nền gốc (%)", 0, 100, AUTO_BG_VOLUME_PCT, step=1,
+                                   disabled=not adv_override_bg_volume)
+
+    st.markdown("---")
+    adv_model_size = st.selectbox("Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=1)
+    adv_speed_label = st.select_slider("Tốc độ xử lý", options=list(SPEED_PRESETS.keys()),
+                                        value="⚖️ Cân bằng (khuyến nghị)")
+
+# ---------- Gộp các giá trị: tự động, trừ khi người dùng ghi đè ở phần nâng cao ----------
+burn_sub = adv_burn_sub
+bilingual = adv_bilingual
+position_label = adv_position_label
+margin_v = adv_margin_v
+model_size = adv_model_size
+speed_label = adv_speed_label
+speed_cfg = SPEED_PRESETS[speed_label]
+
+remove_old_sub = not adv_disable_remove_old
+old_sub_method_key = adv_old_method_key
+box_color = adv_box_color
+blur_strength = adv_blur_strength
+
+enable_dub = not adv_disable_dub
+keep_bg = adv_keep_bg
+voice = voice_style["voice"]
+tts_rate_pct = voice_style["rate"]
+tts_volume_pct = 0
+tts_pitch_hz = voice_style["pitch"]
+
+if enable_dub:
+    original_volume_pct = adv_bg_volume_pct if adv_override_bg_volume else AUTO_BG_VOLUME_PCT
+else:
+    original_volume_pct = AUTO_NO_DUB_VOLUME_PCT
+
+# Vùng che phụ đề gốc: ưu tiên tuỳ chỉnh tay nếu bật, không thì dùng vùng tự động phát hiện
+old_sub_box = None
+if remove_old_sub and pw and ph:
+    if adv_manual_old_box and manual_box_pct:
+        old_sub_box = compute_free_box(pw, ph, *manual_box_pct)
+    elif detected_box:
+        old_sub_box = detected_box
+
+# ---------- 4) KHỐI XEM TRƯỚC DUY NHẤT ----------
+st.divider()
+st.subheader("🖼️ Xem trước")
+
+combined_preview_ready = False
+if active_video_path is None:
+    st.info("Tải video lên hoặc dán link Douyin ở trên để xem bản xem trước.")
+elif preview_frame_path is None:
+    st.warning("Không có khung hình xem trước cho video này — vẫn xử lý được, chỉ là không kiểm tra trước được vị trí/màu sắc.")
+else:
+    combined_img = Image.open(preview_frame_path).convert("RGB")
+    if remove_old_sub and old_sub_box is not None:
+        combined_img = render_old_sub_box_preview(combined_img, old_sub_box, old_sub_method_key, box_color, blur_strength)
+    if burn_sub:
+        combined_img = render_subtitle_style_preview(
+            combined_img, SAMPLE_SUBTITLE_TEXT, font_size, text_color, outline_color,
+            POSITION_OPTIONS[position_label], margin_v,
+        )
+    st.image(combined_img, use_container_width=True)
+
+    legend_bits = []
+    if remove_old_sub:
+        legend_bits.append("🟥 khung đỏ = vùng phụ đề gốc được **tự động phát hiện** và sẽ bị làm mờ/che")
+    if burn_sub:
+        legend_bits.append("🔤 chữ mẫu = kiểu phụ đề mới sẽ ghi lên video")
+    if legend_bits:
+        st.caption(" · ".join(legend_bits) + ". Đây là hình mô phỏng gần đúng, kết quả thật có thể chênh lệch nhẹ.")
+    if remove_old_sub and not adv_manual_old_box:
+        st.caption("💡 Nếu khung đỏ chưa khớp chính xác vùng phụ đề gốc, mở '⚙️ Tuỳ chỉnh nâng cao' để tự kéo tay.")
+
+    if enable_dub:
+        st.markdown(f"**🔊 Nghe thử giọng đọc: {voice_style_label}**")
+        if st.button("▶️ Nghe thử giọng đọc mẫu", key="btn_tts_preview"):
+            with st.spinner("Đang tạo giọng đọc mẫu..."):
+                try:
+                    tts_preview_path = os.path.join(st.session_state.workdir, "tts_preview.mp3")
+                    generate_tts_preview_audio(
+                        voice,
+                        f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%",
+                        f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%",
+                        f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz",
+                        tts_preview_path,
+                    )
+                    with open(tts_preview_path, "rb") as f:
+                        st.session_state.tts_preview_bytes = f.read()
+                except Exception as e:
+                    st.error(f"Không tạo được giọng đọc mẫu: {e}")
+                    st.session_state.tts_preview_bytes = None
+        if st.session_state.get("tts_preview_bytes"):
+            st.audio(st.session_state.tts_preview_bytes, format="audio/mp3")
+
+    combined_preview_ready = True
+
+# ---------- 5) XÁC NHẬN + BẮT ĐẦU XỬ LÝ ----------
+st.divider()
+confirm_preview = st.checkbox(
+    "✅ Tôi đã xem bản xem trước ở trên và muốn xử lý toàn bộ video",
+    value=False, disabled=not combined_preview_ready,
+)
+start_button = st.button("🚀 Bắt đầu xử lý", type="primary",
+                          disabled=(active_video_path is None) or (not confirm_preview))
+if active_video_path is not None and not confirm_preview:
+    st.caption("👆 Tick vào ô xác nhận sau khi xem bản xem trước để mở khóa nút xử lý.")
+
+if start_button:
+    if not burn_sub and not enable_dub and not remove_old_sub:
+        st.warning("Bạn cần bật ít nhất một trong: ghi phụ đề chữ, xoá phụ đề gốc, hoặc lồng tiếng AI (xem phần Tuỳ chỉnh nâng cao).")
+        st.stop()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ext = os.path.splitext(active_video_name or active_video_path)[1] or ".mp4"
+        input_path = os.path.join(tmp_dir, "input" + ext)
+        shutil.copy(active_video_path, input_path)
+
+        audio_path = os.path.join(tmp_dir, "audio.wav")
+        srt_path = os.path.join(tmp_dir, "output.srt")
+
+        status = st.status("Đang xử lý...", expanded=True)
+
+        try:
+            status.write("🔊 Đang tách âm thanh...")
+            extract_audio(input_path, audio_path)
+            total_duration = ffprobe_duration(input_path)
+
+            status.write("🗣️ Đang nhận diện giọng nói tiếng Trung...")
+            transcribe_placeholder = st.empty()
+            segments = transcribe_audio(
+                audio_path, model_size, beam_size=speed_cfg["beam_size"],
+                progress_cb=lambda t, text: transcribe_placeholder.write(f"  [{t:.1f}s] {text}")
+            )
+
+            if not segments:
+                status.update(label="Không nhận diện được giọng nói nào.", state="error")
                 st.stop()
-                
-            if not raw_segments:
-                st.warning("Không phát hiện câu thoại nào trong video.")
-                st.stop()
-                
-            # Tiến trình 3
-            progress_area.info("⏳ Đang tiến hành chuyển đổi ngôn ngữ...")
-            translated_segments = translate_segments_fast(raw_segments)
-            
-            srt_content = build_srt(translated_segments)
-            with open(out_srt, "w", encoding="utf-8") as f:
+            status.write(f"✅ Nhận diện xong {len(segments)} câu.")
+
+            status.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
+            translate_bar = st.progress(0)
+            segments = translate_segments(segments, progress_cb=lambda d, t: translate_bar.progress(d / t))
+
+            srt_content = build_srt(segments, bilingual=bilingual)
+            with open(srt_path, "w", encoding="utf-8") as f:
                 f.write(srt_content)
-                
-            # Tiến trình 4
-            progress_area.info("⏳ Đang thực hiện lồng tiếng AI & Ghép phụ đề tốc độ cao...")
-            try:
-                render_and_merge_fast(
-                    video_path=video_path,
-                    output_path=out_video,
-                    srt_path=out_srt,
-                    segments=translated_segments,
-                    voice_info=selected_voice,
-                    remove_old_sub=remove_old_sub,
-                    old_sub_box=current_box,
-                    logo_path=logo_path,
+
+            original_volume_factor = original_volume_pct / 100.0
+            current_video = input_path
+
+            if remove_old_sub or burn_sub:
+                status.write("🎞️ Đang xử lý hình ảnh video (xoá phụ đề gốc tự động phát hiện / ghi phụ đề mới)...")
+                final_old_sub_box = None
+                if remove_old_sub:
+                    width, height = get_video_resolution(current_video)
+                    if adv_manual_old_box and manual_box_pct:
+                        final_old_sub_box = compute_free_box(width, height, *manual_box_pct)
+                    else:
+                        final_old_sub_box = detect_subtitle_region(current_video, width, height, tmp_dir)
+                    # Đảm bảo vùng che luôn nằm gọn trong khung hình, tránh lỗi crop tràn biên.
+                    if final_old_sub_box:
+                        bx, by, bw, bh = final_old_sub_box
+                        bw = min(bw, width - bx - 2)
+                        bh = min(bh, height - by - 2)
+                        if bw < 4 or bh < 4:
+                            final_old_sub_box = None
+                        else:
+                            final_old_sub_box = (bx, by, bw, bh)
+
+                processed_output = os.path.join(tmp_dir, "processed.mp4")
+                process_video(
+                    current_video, processed_output,
+                    remove_old_sub=remove_old_sub, old_sub_method=old_sub_method_key,
+                    old_sub_box=final_old_sub_box, old_sub_color=hex_to_ffmpeg_color(box_color),
+                    blur_strength=blur_strength,
+                    burn_new_sub=burn_sub, srt_path=srt_path,
                     font_size=font_size,
                     primary_color=hex_to_ass_color(text_color),
                     outline_color=hex_to_ass_color(outline_color),
-                    bg_volume_pct=bg_vol,
-                    voice_volume_pct=voice_vol,
-                    alignment=sub_alignment,
-                    margin_v=sub_margin_v
+                    alignment=POSITION_OPTIONS[position_label],
+                    margin_v=margin_v,
+                    video_preset=speed_cfg["video_preset"],
                 )
-                
-                progress_area.empty()
-                st.success("🎉 QUÁ TRÌNH HOÀN TẤT THÀNH CÔNG!")
-                st.video(out_video)
-                
-                with open(out_video, "rb") as f:
-                    st.download_button(
-                        label="💾 Tải Video Hoàn Chỉnh Về Máy",
-                        data=f,
-                        file_name=f"Perfect_Dub_{uploaded_file.name}",
-                        mime="video/mp4"
-                    )
-            except Exception as e:
-                st.error(f"Gặp trục trặc trong khâu render cuối: {e}")
+                current_video = processed_output
+
+            dub_warning_count = 0
+            if enable_dub:
+                status.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
+                tts_bar = st.progress(0)
+                rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
+                volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
+                pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
+
+                dub_track_path, failed_indices = build_dub_track(
+                    segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
+                    concurrency=speed_cfg["tts_concurrency"],
+                    progress_cb=lambda d, t: tts_bar.progress(d / t)
+                )
+                dub_warning_count = len(failed_indices)
+
+                status.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
+                dub_output = os.path.join(tmp_dir, "with_dub.mp4")
+                combine_video_with_dub(current_video, dub_track_path, dub_output,
+                                        keep_bg=keep_bg, bg_volume=original_volume_factor)
+                current_video = dub_output
+            elif original_volume_factor != 1.0:
+                status.write("🔊 Đang điều chỉnh âm lượng video gốc...")
+                vol_output = os.path.join(tmp_dir, "with_volume.mp4")
+                adjust_video_volume(current_video, vol_output, original_volume_factor)
+                current_video = vol_output
+
+            status.update(label="Hoàn tất!", state="complete")
+        except FFmpegError as e:
+            status.update(label="Xử lý thất bại ❌", state="error")
+            st.error(f"❌ {e}")
+            st.info("💡 Lỗi thường gặp: video có codec lạ, không có audio, hoặc vùng che phụ đề tràn khung hình. "
+                     "Thử video khác hoặc mở '⚙️ Tuỳ chỉnh nâng cao' để tự chỉnh vùng che / tắt bớt bước xử lý.")
+            st.stop()
+        except Exception as e:
+            status.update(label="Xử lý thất bại ❌", state="error")
+            st.error(f"❌ Lỗi không mong muốn: {e}")
+            st.stop()
+
+        if dub_warning_count > 0:
+            st.warning(
+                f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
+                "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
+            )
+
+        with open(current_video, "rb") as f:
+            video_bytes = f.read()
+
+        st.success("✅ Xử lý xong!")
+        st.subheader("👀 Kết quả cuối cùng")
+        st.video(video_bytes)
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.download_button("⬇️ Tải video kết quả", data=video_bytes,
+                                file_name="video_ket_qua.mp4", mime="video/mp4")
+        with colB:
+            st.download_button("⬇️ Tải file phụ đề (.srt)", data=srt_content,
+                                file_name="phu_de.srt", mime="text/plain")
+
+        with st.expander("📜 Xem nội dung phụ đề"):
+            for seg in segments:
+                st.write(f"**[{seg['start']:.1f}s - {seg['end']:.1f}s]**")
+                if bilingual:
+                    st.write(f"🇨🇳 {seg['text']}")
+                st.write(f"🇻🇳 {seg['translated']}")
+                st.divider()
