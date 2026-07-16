@@ -1,4 +1,3 @@
-
 import asyncio
 import hashlib
 import os
@@ -9,14 +8,21 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-st.set_page_config(page_title="Dịch & Lồng Tiếng Siêu Tốc", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="Dịch & Lồng Tiếng Siêu Tốc", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 780px;}
-    div[data-testid="stVerticalBlock"] > div:has(> div.stButton) button {width: 100%;}
+    .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+    div[data-testid="stVerticalBlock"] > div:has(> div.stButton) button {width: 100%; height: 50px; font-weight: bold; font-size: 1.1rem;}
     .stTabs [data-baseweb="tab"] {padding: 0.4rem 0.8rem; font-size: 0.92rem;}
     div[data-testid="stSlider"] {padding-bottom: 0.2rem;}
+    .highlight-box {
+        padding: 15px;
+        border-radius: 8px;
+        background-color: #f0f2f6;
+        margin-bottom: 15px;
+        border-left: 5px solid #ff4b4b;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -30,7 +36,6 @@ VOICE_CATALOG = [
 ]
 
 CPU_COUNT = os.cpu_count() or 4
-SAMPLE_SUBTITLE_TEXT = "Đây là câu phụ đề mẫu để xem trước"
 
 # ============================================================
 # CÁC HÀM XỬ LÝ TỐC ĐỘ CAO
@@ -40,7 +45,6 @@ class FFmpegError(RuntimeError):
     pass
 
 def _run_ffmpeg(cmd, label: str = "ffmpeg"):
-    # Ép ffmpeg chạy ẩn và tối ưu hóa xử lý để tăng tốc
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         stderr_tail = "\n".join(result.stderr.strip().splitlines()[-15:]) if result.stderr else "(không có thông tin)"
@@ -48,7 +52,6 @@ def _run_ffmpeg(cmd, label: str = "ffmpeg"):
     return result
 
 def extract_audio(video_path: str, audio_path: str):
-    # Trích xuất nhanh, bỏ bớt các kênh không cần thiết
     cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-threads", str(CPU_COUNT), audio_path]
     _run_ffmpeg(cmd, label="tách âm thanh tốc độ cao")
 
@@ -71,12 +74,10 @@ def get_video_resolution(path: str):
 @st.cache_resource(show_spinner=False)
 def load_whisper_model(model_size: str):
     from faster_whisper import WhisperModel
-    # Ép luồng tối đa để chạy Whisper nhanh nhất trên CPU
     return WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=CPU_COUNT)
 
 def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 1, progress_cb=None):
     model = load_whisper_model(model_size)
-    # beam_size = 1 giúp Whisper chạy nhanh gấp nhiều lần bình thường
     segments, info = model.transcribe(audio_path, language="zh", vad_filter=True, beam_size=beam_size)
     results = []
     for seg in segments:
@@ -86,14 +87,12 @@ def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 1, progr
     return results
 
 def translate_segments_fast(segments, progress_cb=None, chunk_size: int = 80):
-    """Nâng cấp tốc độ dịch bằng cách tăng kích thước cụm gửi đi (chunk_size từ 40 lên 80)"""
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source="zh-CN", target="vi")
 
     texts = [seg["text"] for seg in segments]
     translated_all = [None] * len(segments)
 
-    # Chia mảng dịch nhanh theo cụm lớn để tránh bị nghẽn API mạng
     for start in range(0, len(texts), chunk_size):
         chunk = texts[start:start + chunk_size]
         try:
@@ -116,7 +115,6 @@ def translate_segments_fast(segments, progress_cb=None, chunk_size: int = 80):
             progress_cb(done, len(texts))
 
     for seg, translated in zip(segments, translated_all):
-        # Dọn dẹp khoảng trắng thừa cho câu từ gọn gàng, tự nhiên
         seg["translated"] = " ".join(translated.split()) if translated else seg["text"]
     return segments
 
@@ -152,11 +150,10 @@ def auto_outline_color(text_color_hex: str) -> str:
     return "#000000" if luminance > 0.55 else "#FFFFFF"
 
 # ============================================================
-# TỰ ĐỘNG QUÉT VÙNG PHỤ ĐỀ (DÙNG ĐỂ GỢI Ý KHI CHỈNH SỬA)
+# TỰ ĐỘNG QUÉT VÙNG PHỤ ĐỀ (AUTO DETECTION)
 # ============================================================
 
 def detect_subtitle_region_fast(video_path: str, width: int, height: int, tmp_dir: str):
-    """Thuật toán quét nhanh tìm vùng phụ đề để điền trước thông số cho người dùng"""
     try:
         dur = ffprobe_duration(video_path)
         timestamps = [dur * 0.25, dur * 0.5, dur * 0.75]
@@ -226,7 +223,8 @@ def generate_voice_gtts(text: str, output_path: str):
 def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segments: list, voice_info: dict,
                           remove_old_sub: bool, old_sub_box, logo_path: str = None, font_size: int = 22,
                           primary_color: str = "&H00FFFFFF&", outline_color: str = "&H00000000&",
-                          bg_volume_pct: int = 10):
+                          bg_volume_pct: int = 15, voice_volume_pct: int = 100,
+                          alignment: int = 2, margin_v: int = 25):
     
     tmp_dir = ensure_workdir()
     audio_segments_paths = []
@@ -242,7 +240,7 @@ def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segm
             generate_voice_gtts(text, audio_seg_path)
         audio_segments_paths.append((seg["start"], audio_seg_path))
 
-    # 2. Xây dựng cấu hình âm thanh lồng đè nhanh
+    # 2. Xây dựng cấu hình âm lượng lồng đè nhanh (Hỗ trợ kéo thủ công)
     filter_complex_audio = ""
     inputs_audio_cmd = ["-i", video_path]
     
@@ -250,28 +248,31 @@ def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segm
         inputs_audio_cmd.extend(["-i", path])
     
     bg_vol = bg_volume_pct / 100.0
+    v_vol = voice_volume_pct / 100.0
+    
+    # Giảm âm lượng video gốc
     filter_complex_audio += f"[0:a]volume={bg_vol}[bg_audio];"
     
+    # Ghép nối các file giọng đọc AI và khuếch đại âm lượng theo mong muốn
     mix_inputs = ""
     for idx, (start_time, _) in enumerate(audio_segments_paths):
         filter_complex_audio += f"[{idx+1}:a]adelay={int(start_time*1000)}|{int(start_time*1000)}[delay{idx}];"
         mix_inputs += f"[delay{idx}]"
     
-    filter_complex_audio += f"{mix_inputs}amix=inputs={len(audio_segments_paths)}:dropout_transition=0[dub_audio];"
+    filter_complex_audio += f"{mix_inputs}amix=inputs={len(audio_segments_paths)}:dropout_transition=0,volume={v_vol}[dub_audio];"
     filter_complex_audio += f"[bg_audio][dub_audio]amix=inputs=2:duration=first[out_audio]"
 
     temp_audio_mixed = os.path.join(tmp_dir, "audio_mixed.mp3")
     cmd_audio = ["ffmpeg", "-y"] + inputs_audio_cmd + ["-filter_complex", filter_complex_audio, "-map", "[out_audio]", "-threads", str(CPU_COUNT), temp_audio_mixed]
     _run_ffmpeg(cmd_audio, label="trộn âm thanh nền và giọng đọc AI")
 
-    # 3. Tạo bộ lọc hình ảnh (Xóa sub cũ + Chèn Logo + Ghi đè sub mới)
+    # 3. Tạo bộ lọc hình ảnh (Xóa sub cũ + Chèn Logo + Ghi đè sub mới kèm tùy chỉnh vị trí)
     filters = []
     stage = "[0:v]"
     counter = 0
 
     if remove_old_sub and old_sub_box:
         x, y, w, h = old_sub_box
-        # Áp dụng bộ lọc boxblur siêu tốc độ để che phụ đề gốc
         filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
         filters.append(
             f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
@@ -288,10 +289,11 @@ def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segm
 
     if srt_path:
         srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+        # Tùy biến Alignment và MarginV trực tiếp từ người dùng
         style = (
             f"FontName=Arial,FontSize={font_size},PrimaryColour={primary_color},"
             f"OutlineColour={outline_color},BorderStyle=1,Outline=1.2,Shadow=0.5,"
-            f"Alignment=2,MarginV=25"
+            f"Alignment={alignment},MarginV={margin_v}"
         )
         filters.append(f"{stage}subtitles={srt_escaped}:force_style='{style}'[vout]")
         stage = "[vout]"
@@ -310,8 +312,8 @@ def render_and_merge_fast(video_path: str, output_path: str, srt_path: str, segm
         "-filter_complex", filter_complex_video,
         "-map", stage,
         "-map", f"{2 if logo_path else 1}:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",  # ultrafast ép tốc độ render hình ảnh nhanh nhất
-        "-threads", "0",  # Tận dụng toàn bộ nhân CPU
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+        "-threads", "0",
         "-c:a", "aac", "-b:a", "128k",
         output_path
     ])
@@ -337,7 +339,6 @@ def get_persistent_video_path(uploaded_file) -> str:
     return path
 
 def extract_preview_frame(video_path: str, frame_path: str) -> bool:
-    """Trích xuất nhanh một khung hình ở giây thứ 3 của video để làm ảnh xem trước"""
     try:
         cmd = [
             "ffmpeg", "-y",
@@ -381,24 +382,46 @@ def ensure_preview_frame(video_path: str):
         return frame_path, resolution
     return None, None
 
-def render_preview_with_box(frame_path: str, box, logo_path: str = None) -> "Image.Image":
+def render_preview_with_box(frame_path: str, box, logo_path: str = None, font_size: int = 24, text_color: str = "#FFFFFF", alignment: int = 2, margin_v: int = 25) -> "Image.Image":
     img = Image.open(frame_path)
     draw = ImageDraw.Draw(img)
     w, h = img.size
     
-    # Vẽ hộp xóa phụ đề
+    # 1. Vẽ hộp xóa phụ đề
     if box:
         x, y, bw, bh = box
         draw.rectangle([x, y, x + bw, y + bh], outline="#FF3333", width=4)
         draw.text((x + 10, max(0, y - 25)), "VÙNG LÀM MỜ (XÓA SUB GỐC)", fill="#FF3333")
         
-    # Vẽ logo thử nghiệm
+    # 2. Vẽ logo thử nghiệm
     if logo_path and os.path.exists(logo_path):
         logo_img = Image.open(logo_path).convert("RGBA")
-        preview_logo_size = max(int(h * 0.15), 45)
+        preview_logo_size = max(int(h * 0.12), 45)
         logo_img = logo_img.resize((preview_logo_size, preview_logo_size))
         img.paste(logo_img, (20, 20), mask=logo_img)
-        draw.text((20, 25 + preview_logo_size), "LOGO KÊNH", fill="#00FF00")
+        draw.text((20, 25 + preview_logo_size), "LOGO", fill="#00FF00")
+        
+    # 3. Vẽ chữ phụ đề mới mô phỏng vị trí (Alignment & MarginV)
+    try:
+        sample_text = "Phụ đề mẫu tiếng Việt sau dịch"
+        # Font chữ mặc định
+        font = ImageFont.load_default()
+        
+        # Mô phỏng Alignment (Trái=1, Giữa=2, Phải=3)
+        # Tính toán tọa độ Y từ đáy lên
+        y_pos = h - margin_v - font_size
+        
+        if alignment == 1: # Trái
+            x_pos = int(w * 0.05)
+        elif alignment == 3: # Phải
+            x_pos = int(w * 0.95) - 200
+        else: # Giữa
+            x_pos = (w - 200) // 2
+            
+        draw.rectangle([x_pos - 5, y_pos - 2, x_pos + 205, y_pos + font_size + 2], fill="#00000099")
+        draw.text((x_pos, y_pos), sample_text, fill=text_color)
+    except Exception:
+        pass
         
     return img
 
@@ -406,8 +429,8 @@ def render_preview_with_box(frame_path: str, box, logo_path: str = None) -> "Ima
 # GIAO DIỆN CHÍNH (UI)
 # ============================================================
 
-st.title("⚡ Dịch & Lồng Tiếng Tốc Độ Cao")
-st.caption("Bản nâng cấp tối đa tốc độ dịch, bỏ nhận diện giọng nam nữ cũ và thêm bộ kéo chỉnh tay kích thước khung xóa sub.")
+st.title("⚡ Dịch & Lồng Tiếng Tự Động / Tinh Chỉnh Thủ Công")
+st.caption("Bản nâng cấp: Tự động hóa hoàn toàn kèm các nút gạt/thanh trượt điều khiển âm lượng và tọa độ phụ đề trực quan.")
 
 uploaded_file = st.file_uploader("Tải video lên máy", type=["mp4", "mkv", "mov", "avi"])
 
@@ -417,9 +440,9 @@ if uploaded_file:
     
     if frame_path and resolution:
         width, height = resolution
-        st.success(f"Nhận diện độ phân giải: {width}x{height} px")
+        st.success(f"Nhận diện video thành công: {width}x{height} px")
         
-        # Tạo đề xuất vị trí xóa sub ban đầu nếu chưa có
+        # Khởi tạo giá trị mặc định cho vùng xóa phụ đề nếu chưa có
         if "box_x" not in st.session_state:
             def_x, def_y, def_w, def_h = detect_subtitle_region_fast(video_path, width, height, st.session_state.workdir)
             st.session_state.box_x = def_x
@@ -427,58 +450,101 @@ if uploaded_file:
             st.session_state.box_w = def_w
             st.session_state.box_h = def_h
 
-        col1, col2 = st.columns(2)
+        # Chia bố cục cột tinh chỉnh
+        col_ctrl, col_preview = st.columns([1, 1])
         
-        with col1:
-            st.subheader("⚙️ Thiết lập xóa phụ đề & Logo")
+        with col_ctrl:
+            st.subheader("🛠️ Bộ Điều Khiển Tự Động & Thủ Công")
             
+            # --- PHẦN 1: ĐIỀU CHỈNH ÂM LƯỢNG (MỚI) ---
+            st.markdown("<div class='highlight-box'>🔊 THIẾT LẬP ÂM LƯỢNG</div>", unsafe_allow_html=True)
+            auto_volume = st.checkbox("⚙️ Tự động hóa âm lượng (Giảm nhạc gốc còn 15%, Giọng AI 100%)", value=True)
+            
+            if not auto_volume:
+                bg_vol = st.slider("📁 Âm lượng video gốc (Nhạc nền):", 0, 100, 15, format="%d%%")
+                voice_vol = st.slider("🎙️ Âm lượng giọng AI lồng tiếng:", 0, 200, 100, format="%d%%")
+            else:
+                bg_vol = 15
+                voice_vol = 100
+                st.info("💡 Hệ thống đang tự động tối ưu hóa âm lượng.")
+                
+            st.write("")
+            
+            # --- PHẦN 2: ĐIỀU CHỈNH VỊ TRÍ PHỤ ĐỀ MỚI (MỚI) ---
+            st.markdown("<div class='highlight-box'>📝 VỊ TRÍ PHỤ ĐỀ MỚI</div>", unsafe_allow_html=True)
+            auto_sub_pos = st.checkbox("⚙️ Tự động căn giữa chân màn hình (Bottom-Center)", value=True)
+            
+            if not auto_sub_pos:
+                align_option = st.selectbox("Căn lề phụ đề:", ["Căn giữa (Center)", "Căn trái (Left)", "Căn phải (Right)"])
+                alignment_map = {"Căn trái (Left)": 1, "Căn giữa (Center)": 2, "Căn phải (Right)": 3}
+                sub_alignment = alignment_map[align_option]
+                
+                sub_margin_v = st.slider("Độ cao so với đáy (MarginV):", 5, int(height * 0.4), 25)
+            else:
+                sub_alignment = 2
+                sub_margin_v = 25
+                st.info("💡 Phụ đề mới tự động căn giữa cách đáy 25px.")
+                
+            st.write("")
+            
+            # --- PHẦN 3: XÓA PHỤ ĐỀ CŨ VÀ LOGO ---
+            st.markdown("<div class='highlight-box'>🖼️ CHỈNH SỬA KHUNG HÌNH</div>", unsafe_allow_html=True)
             remove_old_sub = st.checkbox("Bật chế độ xóa phụ đề gốc", value=True)
             
-            # BỘ KÉO CHỈNH TAY VỊ TRÍ VÀ KÍCH THƯỚC XÓA PHỤ ĐỀ GỐC
             if remove_old_sub:
-                st.write("**Chỉnh sửa khung làm mờ xóa sub gốc:**")
-                bx = st.slider("Tọa độ ngang X (Trái sang Phải):", 0, width, st.session_state.box_x)
-                by = st.slider("Tọa độ dọc Y (Trên xuống Dưới):", 0, height, st.session_state.box_y)
-                bw = st.slider("Chiều Rộng khung (Width):", 10, width - bx, st.session_state.box_w)
-                bh = st.slider("Chiều Cao khung (Height):", 10, height - by, st.session_state.box_h)
-                
-                # Lưu lại thông số vào state
-                st.session_state.box_x = bx
-                st.session_state.box_y = by
-                st.session_state.box_w = bw
-                st.session_state.box_h = bh
-                current_box = (bx, by, bw, bh)
+                auto_box = st.checkbox("⚙️ Tự động nhận diện vùng chứa sub cũ", value=True)
+                if not auto_box:
+                    bx = st.slider("Tọa độ ngang X (Trái sang Phải):", 0, width, st.session_state.box_x)
+                    by = st.slider("Tọa độ dọc Y (Trên xuống Dưới):", 0, height, st.session_state.box_y)
+                    bw = st.slider("Chiều Rộng khung (Width):", 10, width - bx, st.session_state.box_w)
+                    bh = st.slider("Chiều Cao khung (Height):", 10, height - by, st.session_state.box_h)
+                    
+                    st.session_state.box_x = bx
+                    st.session_state.box_y = by
+                    st.session_state.box_w = bw
+                    st.session_state.box_h = bh
+                    current_box = (bx, by, bw, bh)
+                else:
+                    current_box = (st.session_state.box_x, st.session_state.box_y, st.session_state.box_w, st.session_state.box_h)
+                    st.info("💡 Đang sử dụng tọa độ nhận diện tự động.")
             else:
                 current_box = None
                 
-            st.write("---")
-            # Tải ảnh logo kênh
+            st.write("")
             logo_file = st.file_uploader("In logo kênh hình tròn góc trái trên:", type=["png", "jpg", "jpeg"])
             logo_path = None
             if logo_file:
                 logo_target_size = max(int(height * 0.12), 60)
                 logo_path = make_circle_logo(logo_file, size=logo_target_size)
-                st.success("Đã bo tròn logo kênh thành công!")
+                st.success("Đã bo tròn logo thành công!")
                 
-            st.write("---")
-            # Thiết lập giọng đọc duy nhất
+            st.write("")
             voice_labels = [v["label"] for v in VOICE_CATALOG]
             selected_voice_label = st.selectbox("Giọng đọc lồng tiếng:", voice_labels)
             selected_voice = next(v for v in VOICE_CATALOG if v["label"] == selected_voice_label)
 
-        with col2:
-            st.subheader("📺 Khung xem trước")
+        with col_preview:
+            st.subheader("📺 Khung Xem Trước (Thời Gian Thực)")
             
-            # Cập nhật xem trước ngay lập tức khi kéo thanh trượt
-            preview_img = render_preview_with_box(frame_path, current_box, logo_path)
-            st.image(preview_img, use_column_width=True, caption="Khung chỉnh vùng xóa sub (Hộp đỏ) & Vị trí Logo kênh (Thực tế)")
-            
-            st.write("---")
-            font_size = st.slider("Cỡ chữ phụ đề mới (px):", 12, 50, 24)
+            # Cấu hình cỡ chữ và màu sắc
+            font_size = st.slider("Cỡ chữ phụ đề mới (px):", 12, 60, 24)
             text_color = st.color_picker("Màu chữ phụ đề mới:", "#FFFFFF")
             outline_color = auto_outline_color(text_color)
+            
+            # Render xem trước các thay đổi
+            preview_img = render_preview_with_box(
+                frame_path, 
+                current_box if remove_old_sub else None, 
+                logo_path,
+                font_size=font_size,
+                text_color=text_color,
+                alignment=sub_alignment,
+                margin_v=sub_margin_v
+            )
+            st.image(preview_img, use_container_width=True, caption="Hình ảnh mô phỏng vị trí các thành phần trên video thực tế")
 
-        if st.button("🚀 BẮT ĐẦU XỬ LÝ SIÊU TỐC", type="primary"):
+        # NÚT XỬ LÝ CHÍNH
+        if st.button("🚀 BẮT ĐẦU XỬ LÝ VIDEO", type="primary"):
             st.write("---")
             progress_area = st.empty()
             
@@ -487,12 +553,12 @@ if uploaded_file:
             out_srt = os.path.join(tmp_dir, "subtitles.srt")
             out_video = os.path.join(tmp_dir, "output_final.mp4")
             
-            # Bước 1: Trích xuất nhạc gốc nhanh
+            # Bước 1
             progress_area.info("⏳ Bước 1/4: Đang trích xuất nhạc video gốc...")
             extract_audio(video_path, audio_path)
             
-            # Bước 2: Nhận diện giọng nói với beam_size cực tiểu
-            progress_area.info("⏳ Bước 2/4: Đang nhận diện tiếng Trung bằng AI (Tốc độ tối đa)...")
+            # Bước 2
+            progress_area.info("⏳ Bước 2/4: Đang nhận diện lời thoại tiếng Trung...")
             try:
                 raw_segments = transcribe_audio(audio_path, "base", beam_size=1)
             except Exception as e:
@@ -503,17 +569,16 @@ if uploaded_file:
                 st.warning("Không tìm thấy lời thoại tiếng Trung nào.")
                 st.stop()
                 
-            # Bước 3: Dịch nhanh hơn với chunk_size gấp đôi
+            # Bước 3
             progress_area.info("⏳ Bước 3/4: Đang chuyển ngữ sang Tiếng Việt siêu tốc...")
             translated_segments = translate_segments_fast(raw_segments)
             
-            # Tạo file phụ đề SRT
             srt_content = build_srt(translated_segments)
             with open(out_srt, "w", encoding="utf-8") as f:
                 f.write(srt_content)
                 
-            # Bước 4: Lồng tiếng AI và render đồng bộ với preset=ultrafast
-            progress_area.info("⏳ Bước 4/4: Đang tạo giọng nói AI và nén Video tốc độ cao nhất...")
+            # Bước 4
+            progress_area.info("⏳ Bước 4/4: Đang tạo giọng nói AI và nén Video tốc độ cao...")
             try:
                 render_and_merge_fast(
                     video_path=video_path,
@@ -527,20 +592,22 @@ if uploaded_file:
                     font_size=font_size,
                     primary_color=hex_to_ass_color(text_color),
                     outline_color=hex_to_ass_color(outline_color),
-                    bg_volume_pct=10
+                    bg_volume_pct=bg_vol,
+                    voice_volume_pct=voice_vol,
+                    alignment=sub_alignment,
+                    margin_v=sub_margin_v
                 )
                 
                 progress_area.empty()
-                st.success("🎉 HOÀN THÀNH VIDEO!")
+                st.success("🎉 HOÀN THÀNH VIDEO THÀNH PHẨM!")
                 st.video(out_video)
                 
                 with open(out_video, "rb") as f:
                     st.download_button(
-                        label="💾 Tải Video thành phẩm",
+                        label="💾 Tải Video về máy",
                         data=f,
-                        file_name=f"Fast_{uploaded_file.name}",
+                        file_name=f"Processed_{uploaded_file.name}",
                         mime="video/mp4"
                     )
             except Exception as e:
-                st.error(f"Quá trình ghép nối gặp lỗi: {e}")
-
+                st.error(f"Quá trình xử lý cuối gặp lỗi: {e}")
