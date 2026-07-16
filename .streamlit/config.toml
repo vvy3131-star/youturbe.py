@@ -1,0 +1,11 @@
+# Nâng giới hạn dung lượng video được phép TẢI LÊN (mặc định Streamlit chỉ
+# cho 200MB). File này phải nằm ở đúng đường dẫn ".streamlit/config.toml"
+# cùng cấp với app.py (kể cả khi deploy lên Streamlit Cloud).
+#
+# Lưu ý: giới hạn này chỉ áp dụng cho video TẢI LÊN qua nút "Tải file từ
+# máy". Video tải qua link Douyin không đi qua giới hạn này vì được
+# yt-dlp tải thẳng xuống server, không qua đường upload của trình duyệt.
+
+[server]
+maxUploadSize = 2048
+maxMessageSize = 2048
