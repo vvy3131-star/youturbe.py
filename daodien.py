@@ -2,13 +2,11 @@
 App Streamlit: Dịch phụ đề video tiếng Trung sang tiếng Việt — BẢN TỰ ĐỘNG HOÁ.
 
 Người dùng chỉ cần:
-    1) Tải video lên MÁY (hoặc dán thẳng link Douyin để app tự tải về)
+    1) Tải video lên MÁY
     2) Chọn cỡ chữ phụ đề mới
     3) Chọn giọng đọc AI
     4) Chọn màu chữ phụ đề mới
 Mọi thứ còn lại được xử lý TỰ ĐỘNG:
-    - Dán link https://www.douyin.com/... thì app TỰ TẢI VIDEO VỀ (dùng
-      yt-dlp), không cần tự tải xuống máy rồi mới upload lại.
     - Tự động phát hiện vùng phụ đề tiếng Trung gốc (ghi cứng trên hình) và
       tự động làm mờ (blur) để che đi, không cần tự kéo khung.
     - Tự động lồng tiếng AI tiếng Việt cho toàn bộ video.
@@ -16,16 +14,14 @@ Mọi thứ còn lại được xử lý TỰ ĐỘNG:
       tiếng nền/nhạc nền phía sau giọng đọc AI (không tắt hẳn để video không
       bị "cụt" tiếng động).
     - Tự động chọn màu viền chữ tương phản với màu chữ đã chọn.
-    - Tự động chọn vị trí, lề, model nhận diện, tốc độ xử lý ở mức cân bằng.
+    - Tự động chọn vị trí, lề, model nhận diện, tốc độ xử lý ở mức nhanh nhất.
 
 Vẫn có một khối "Tuỳ chỉnh nâng cao (không bắt buộc)" ẩn sẵn cho ai muốn tự
 tay chỉnh từng thông số như bản gốc.
 
 GIỚI HẠN DUNG LƯỢNG VIDEO:
     Mặc định Streamlit chỉ cho upload tối đa 200MB/file. Để nâng giới hạn
-    này (vd cho video upload trực tiếp, không áp dụng cho video tải qua
-    link Douyin vì link không đi qua giới hạn upload), tạo file
-    `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
+    này, tạo file `.streamlit/config.toml` cùng thư mục với app.py, nội dung:
 
         [server]
         maxUploadSize = 2048
@@ -35,7 +31,7 @@ GIỚI HẠN DUNG LƯỢNG VIDEO:
     được đính kèm sẵn — chỉ cần copy vào đúng vị trí.
 
 CÀI ĐẶT (chạy 1 lần, local):
-    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy yt-dlp --break-system-packages
+    pip install streamlit faster-whisper deep-translator edge-tts Pillow numpy --break-system-packages
     # cần có ffmpeg cài sẵn trên máy (sudo apt install ffmpeg / brew install ffmpeg)
 
 CHẠY APP (local):
@@ -43,7 +39,7 @@ CHẠY APP (local):
 
 TRÊN STREAMLIT CLOUD:
     Cần có các file cùng thư mục gốc:
-    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy, yt-dlp)
+    - requirements.txt (streamlit, faster-whisper, deep-translator, edge-tts, Pillow, numpy)
     - packages.txt (ffmpeg)
     - .streamlit/config.toml (xem phần "GIỚI HẠN DUNG LƯỢNG VIDEO" ở trên)
 """
@@ -97,7 +93,7 @@ POSITION_OPTIONS = {
 
 # ---------- CHẾ ĐỘ TỐC ĐỘ XỬ LÝ ----------
 SPEED_PRESETS = {
-    "⚡ Nhanh nhất": {"beam_size": 1, "video_preset": "ultrafast", "tts_concurrency": 10},
+    "⚡ Nhanh nhất": {"beam_size": 1, "video_preset": "ultrafast", "tts_concurrency": 12},
     "⚖️ Cân bằng (khuyến nghị)": {"beam_size": 3, "video_preset": "veryfast", "tts_concurrency": 6},
     "🎯 Chính xác nhất (chậm hơn)": {"beam_size": 5, "video_preset": "medium", "tts_concurrency": 4},
 }
@@ -112,6 +108,15 @@ SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe th
 AUTO_BG_VOLUME_PCT = 8
 # Âm lượng gốc tự động khi KHÔNG lồng tiếng (giữ nguyên).
 AUTO_NO_DUB_VOLUME_PCT = 100
+
+# Tốc độ đọc nhanh tối đa cho phép khi "ép" audio TTS khớp với khung thời
+# gian của phụ đề gốc. Trước đây audio bị tăng tốc (atempo) bằng đúng tỉ lệ
+# dur/target_duration, có thể lên tới 2-3x khiến giọng đọc nghe rất nhanh và
+# không tự nhiên dù khớp thời gian tuyệt đối. Giới hạn lại ở mức vừa phải
+# (tối đa nhanh hơn ~15%) để giọng đọc luôn tự nhiên; nếu vẫn còn dư thời
+# gian thì chấp nhận audio tràn nhẹ sang khoảng của câu kế tiếp thay vì ép
+# đọc nhanh bất tự nhiên.
+MAX_TTS_SPEEDUP = 1.15
 
 
 # ============================================================
@@ -485,67 +490,6 @@ def detect_subtitle_region(video_path: str, width: int, height: int, tmp_dir: st
 
 
 # ============================================================
-# TẢI VIDEO TRỰC TIẾP TỪ LINK DOUYIN (không cần tự tải xuống máy rồi upload lại)
-# ============================================================
-
-class VideoDownloadError(RuntimeError):
-    pass
-
-
-def download_video_from_url(url: str, out_dir: str, progress_cb=None):
-    """Dùng yt-dlp để tải video từ link Douyin (hoặc các link video khác mà
-    yt-dlp hỗ trợ) về out_dir. Trả về (đường_dẫn_file, tiêu_đề)."""
-    try:
-        import yt_dlp
-    except ImportError:
-        raise VideoDownloadError(
-            "Chưa cài thư viện yt-dlp. Chạy: pip install yt-dlp --break-system-packages"
-        )
-
-    out_template = os.path.join(out_dir, "douyin_%(id)s.%(ext)s")
-
-    def hook(d):
-        if progress_cb and d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded = d.get("downloaded_bytes", 0)
-            if total:
-                progress_cb(min(downloaded / total, 1.0))
-
-    ydl_opts = {
-        "outtmpl": out_template,
-        "format": "bv*+ba/best/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "progress_hooks": [hook] if progress_cb else [],
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base, _ = os.path.splitext(filepath)
-                for alt_ext in (".mp4", ".mkv", ".webm"):
-                    candidate = base + alt_ext
-                    if os.path.exists(candidate):
-                        filepath = candidate
-                        break
-            title = (info.get("title") or "video_douyin").strip()
-    except Exception as e:
-        raise VideoDownloadError(
-            f"Không tải được video từ link này. Có thể do: link sai/riêng tư/đã bị gỡ, "
-            f"video bị chặn khu vực, hoặc Douyin đã đổi cách bảo vệ link.\n\nChi tiết: {e}"
-        )
-
-    if not filepath or not os.path.exists(filepath):
-        raise VideoDownloadError("Tải xong nhưng không tìm thấy file video kết quả.")
-
-    return filepath, title
-
-
-# ============================================================
 # CÁC HÀM XEM TRƯỚC (PREVIEW) — chỉ thao tác trên 1 khung hình mẫu, cực nhanh
 # ============================================================
 
@@ -741,19 +685,33 @@ def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
 
 
 def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
+    """Khớp audio TTS vào khung thời gian `target_duration` của câu phụ đề.
+
+    QUAN TRỌNG: trước đây hàm này ép audio khớp CHÍNH XÁC bằng atempo với hệ
+    số = dur/target_duration, có thể khiến giọng đọc bị tăng tốc rất mạnh
+    (2x, 3x...) và nghe cực kỳ không tự nhiên dù khớp thời gian tuyệt đối.
+    Giờ đây tốc độ tăng tối đa được giới hạn ở MAX_TTS_SPEEDUP (~1.15x, gần
+    như không nhận ra được là bị tua nhanh). Nếu audio vẫn còn dài hơn
+    target_duration sau khi giới hạn tốc độ, chấp nhận để audio tràn nhẹ ra
+    ngoài khung của câu đó (sẽ trộn/overlap nhẹ với câu kế tiếp trong bước
+    mix track) thay vì ép đọc nhanh nghe giả tạo.
+    """
     dur = ffprobe_duration(in_path)
     if dur <= target_duration or target_duration <= 0:
         subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
                         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
+
     factor = dur / target_duration
-    filters = []
-    remaining = factor
-    while remaining > 2.0:
-        filters.append("atempo=2.0")
-        remaining /= 2.0
-    filters.append(f"atempo={remaining:.3f}")
-    subprocess.run(["ffmpeg", "-y", "-i", in_path, "-filter:a", ",".join(filters), "-ar", "24000", "-ac", "1", out_path],
+    factor = min(factor, MAX_TTS_SPEEDUP)
+
+    if factor <= 1.02:
+        # Chênh lệch không đáng kể, giữ nguyên tốc độ đọc tự nhiên.
+        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    subprocess.run(["ffmpeg", "-y", "-i", in_path, "-filter:a", f"atempo={factor:.3f}", "-ar", "24000", "-ac", "1", out_path],
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -836,50 +794,13 @@ st.caption(
 
 # ---------- 1) TẢI VIDEO ----------
 st.subheader("📥 Nguồn video")
-video_source_mode = st.radio(
-    "Chọn cách đưa video vào",
-    ["📤 Tải file từ máy", "🔗 Dán link Douyin (tự động tải về)"],
-    horizontal=True, label_visibility="collapsed",
-)
+uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
 
 active_video_path = None
 active_video_name = None
-
-if video_source_mode.startswith("📤"):
-    uploaded_file = st.file_uploader("📤 Chọn file video (mp4, mkv, mov, avi)", type=["mp4", "mkv", "mov", "avi"])
-    if uploaded_file is not None:
-        active_video_path = get_persistent_video_path(uploaded_file)
-        active_video_name = uploaded_file.name
-else:
-    douyin_url = st.text_input(
-        "🔗 Dán link video Douyin vào đây",
-        placeholder="https://www.douyin.com/video/... hoặc link chia sẻ dạng v.douyin.com/...",
-    )
-    dl_col1, dl_col2 = st.columns([1, 3])
-    with dl_col1:
-        do_download = st.button("⬇️ Tải video về", disabled=not douyin_url.strip())
-
-    if do_download and douyin_url.strip():
-        ensure_workdir()
-        dl_progress = st.progress(0.0, text="Đang tải video từ Douyin...")
-        try:
-            dl_path, dl_title = download_video_from_url(
-                douyin_url.strip(), st.session_state.workdir,
-                progress_cb=lambda p: dl_progress.progress(p, text=f"Đang tải video từ Douyin... {int(p * 100)}%"),
-            )
-            dl_progress.progress(1.0, text="Tải xong!")
-            st.session_state.douyin_video_path = dl_path
-            st.session_state.douyin_video_name = (dl_title or "video_douyin") + os.path.splitext(dl_path)[1]
-            st.session_state.douyin_source_url = douyin_url.strip()
-            st.success(f"✅ Đã tải xong: {dl_title}")
-        except VideoDownloadError as e:
-            st.error(f"❌ {e}")
-            st.session_state.douyin_video_path = None
-
-    if st.session_state.get("douyin_video_path") and os.path.exists(st.session_state.douyin_video_path):
-        active_video_path = st.session_state.douyin_video_path
-        active_video_name = st.session_state.get("douyin_video_name", "video_douyin.mp4")
-        st.caption(f"🎬 Video đang dùng: **{active_video_name}**")
+if uploaded_file is not None:
+    active_video_path = get_persistent_video_path(uploaded_file)
+    active_video_name = uploaded_file.name
 
 preview_frame_path = None
 preview_video_res = None
@@ -896,7 +817,7 @@ if active_video_path is not None:
         with st.spinner("🔎 Đang tự động phát hiện vùng phụ đề gốc..."):
             detected_box = ensure_detected_box(persistent_video_path, pw, ph)
 else:
-    st.info("👆 Hãy tải video lên hoặc dán link Douyin để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
+    st.info("👆 Hãy tải video lên để bắt đầu — mọi bản xem trước sẽ xuất hiện ngay bên dưới.")
 
 pw, ph = preview_video_res if preview_video_res else (None, None)
 
@@ -970,7 +891,7 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc — để 
     st.markdown("---")
     adv_model_size = st.selectbox("Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=1)
     adv_speed_label = st.select_slider("Tốc độ xử lý", options=list(SPEED_PRESETS.keys()),
-                                        value="⚖️ Cân bằng (khuyến nghị)")
+                                        value="⚡ Nhanh nhất")
 
 # ---------- Gộp các giá trị: tự động, trừ khi người dùng ghi đè ở phần nâng cao ----------
 burn_sub = adv_burn_sub
@@ -1012,7 +933,7 @@ st.subheader("🖼️ Xem trước")
 
 combined_preview_ready = False
 if active_video_path is None:
-    st.info("Tải video lên hoặc dán link Douyin ở trên để xem bản xem trước.")
+    st.info("Tải video lên ở trên để xem bản xem trước.")
 elif preview_frame_path is None:
     st.warning("Không có khung hình xem trước cho video này — vẫn xử lý được, chỉ là không kiểm tra trước được vị trí/màu sắc.")
 else:
@@ -1059,16 +980,9 @@ else:
 
     combined_preview_ready = True
 
-# ---------- 5) XÁC NHẬN + BẮT ĐẦU XỬ LÝ ----------
+# ---------- 5) BẮT ĐẦU XỬ LÝ ----------
 st.divider()
-confirm_preview = st.checkbox(
-    "✅ Tôi đã xem bản xem trước ở trên và muốn xử lý toàn bộ video",
-    value=False, disabled=not combined_preview_ready,
-)
-start_button = st.button("🚀 Bắt đầu xử lý", type="primary",
-                          disabled=(active_video_path is None) or (not confirm_preview))
-if active_video_path is not None and not confirm_preview:
-    st.caption("👆 Tick vào ô xác nhận sau khi xem bản xem trước để mở khóa nút xử lý.")
+start_button = st.button("🚀 Bắt đầu xử lý", type="primary", disabled=active_video_path is None)
 
 if start_button:
     if not burn_sub and not enable_dub and not remove_old_sub:
