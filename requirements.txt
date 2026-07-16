@@ -1,6 +1,7 @@
 streamlit
 faster-whisper
 deep-translator
+edge-tts
 streamlit
 ffmpeg-python
 imageio-ffmpeg
