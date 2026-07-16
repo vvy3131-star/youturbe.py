@@ -336,6 +336,34 @@ def get_persistent_video_path(uploaded_file) -> str:
             f.write(uploaded_file.getbuffer())
     return path
 
+def extract_preview_frame(video_path: str, frame_path: str) -> bool:
+    """Trích xuất nhanh một khung hình ở giây thứ 3 của video để làm ảnh xem trước"""
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", "00:00:03",
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            frame_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return os.path.exists(frame_path)
+    except Exception:
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", "00:00:00",
+                "-i", video_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                frame_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return os.path.exists(frame_path)
+        except Exception:
+            return False
+
 def ensure_preview_frame(video_path: str):
     if st.session_state.get("preview_frame_for") == video_path and st.session_state.get("preview_frame_path"):
         return st.session_state.preview_frame_path, st.session_state.preview_video_res
