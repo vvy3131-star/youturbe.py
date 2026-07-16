@@ -15,6 +15,7 @@ TRÊN STREAMLIT CLOUD:
     - packages.txt (ffmpeg)
 """
 
+import asyncio
 import os
 import subprocess
 import tempfile
@@ -111,8 +112,21 @@ def burn_subtitles(video_path: str, srt_path: str, output_path: str):
 # ---------- CÁC HÀM LỒNG TIẾNG (TTS) ----------
 
 def synthesize_tts(text: str, voice: str, rate: str, pitch: str, out_path: str):
-    cmd = ["edge-tts", "--voice", voice, "--rate", rate, "--pitch", pitch, "--text", text, "--write-media", out_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Gọi thẳng thư viện edge_tts (Python) thay vì gọi lệnh CLI 'edge-tts',
+    vì trên một số môi trường (như Streamlit Cloud) lệnh CLI có thể không nằm trong PATH."""
+    import edge_tts
+
+    async def _run():
+        communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch)
+        await communicate.save(out_path)
+
+    try:
+        asyncio.run(_run())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_run())
+        loop.close()
 
 
 def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
