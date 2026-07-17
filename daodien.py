@@ -115,7 +115,8 @@ AUTO_NO_DUB_VOLUME_PCT = 100
 # không tự nhiên dù khớp thời gian tuyệt đối. Giới hạn lại ở mức vừa phải
 # (tối đa nhanh hơn ~15%) để giọng đọc luôn tự nhiên; nếu vẫn còn dư thời
 # gian thì chấp nhận audio tràn nhẹ sang khoảng của câu kế tiếp thay vì ép
-# đọc nhanh bất tự nhiên.
+# đọc nhanh bất tự nhiên. Phần "tràn" này được xử lý an toàn (không chồng
+# tiếng) ở bước ghép track trong build_dub_track() — xem chú thích ở đó.
 MAX_TTS_SPEEDUP = 1.15
 
 
@@ -692,9 +693,9 @@ def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
     (2x, 3x...) và nghe cực kỳ không tự nhiên dù khớp thời gian tuyệt đối.
     Giờ đây tốc độ tăng tối đa được giới hạn ở MAX_TTS_SPEEDUP (~1.15x, gần
     như không nhận ra được là bị tua nhanh). Nếu audio vẫn còn dài hơn
-    target_duration sau khi giới hạn tốc độ, chấp nhận để audio tràn nhẹ ra
-    ngoài khung của câu đó (sẽ trộn/overlap nhẹ với câu kế tiếp trong bước
-    mix track) thay vì ép đọc nhanh nghe giả tạo.
+    target_duration sau khi giới hạn tốc độ, hàm build_dub_track() ở dưới sẽ
+    lùi thời điểm bắt đầu của (các) câu kế tiếp lại tương ứng, thay vì để
+    chúng chồng lên phần audio còn tràn của câu này.
     """
     dur = ffprobe_duration(in_path)
     if dur <= target_duration or target_duration <= 0:
@@ -735,19 +736,48 @@ def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
     failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch,
                                          concurrency=concurrency, progress_cb=progress_cb)
 
+    # ---- SỬA LỖI CHỒNG TIẾNG (audio đè lên nhau) ----
+    # Trước đây mỗi đoạn TTS được đặt (delay) đúng vào seg["start"] gốc. Nếu
+    # audio của câu trước bị dài hơn khung thời gian của nó (fit_audio_to_duration
+    # chỉ tăng tốc tối đa MAX_TTS_SPEEDUP lần rồi CHẤP NHẬN tràn), audio đó sẽ
+    # kéo dài quá sang thời điểm câu kế tiếp — trong khi câu kế tiếp vẫn được
+    # đặt đúng seg["start"] của nó, khiến 2 audio bị phát ĐÈ LÊN NHAU (chồng
+    # tiếng, nghe rối).
+    #
+    # Cách sửa: theo dõi "cursor" = thời điểm audio của câu ngay trước đó sẽ
+    # kết thúc (thời gian bắt đầu thực tế + độ dài audio thực tế). Câu sau
+    # không bao giờ được phép bắt đầu sớm hơn cursor này — nếu bị trễ so với
+    # timing gốc do câu trước tràn ra, câu sau sẽ bị lùi lại một chút thay vì
+    # chồng lên câu trước. Việc lùi nhẹ vài trăm mili-giây gần như không nghe
+    # thấy lệch, trong khi chồng tiếng thì luôn nghe rất rõ và khó chịu.
     seg_files = []
+    cursor = 0.0
     for idx, text, raw_path in items:
         seg = segments[idx]
         slot_duration = max(seg["end"] - seg["start"], 0.3)
         fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
+
         if idx in failed_indices:
             make_silence(fit_path, slot_duration)
+            actual_dur = slot_duration
         else:
             fit_audio_to_duration(raw_path, fit_path, slot_duration)
-        seg_files.append((seg["start"], fit_path))
+            try:
+                actual_dur = ffprobe_duration(fit_path)
+            except Exception:
+                actual_dur = slot_duration
+
+        actual_start = max(seg["start"], cursor)
+        cursor = actual_start + actual_dur
+
+        seg_files.append((actual_start, fit_path))
+
+    # Nếu các câu bị lùi vì tràn tiếng khiến track dài hơn cả video gốc, mở
+    # rộng track nền im lặng (anullsrc) cho đủ, tránh bị cắt cụt câu cuối.
+    dub_track_duration = max(total_duration, cursor)
 
     dub_track_path = os.path.join(tmp_dir, "dub_track.wav")
-    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={total_duration}"]
+    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={dub_track_duration}"]
     filter_parts = []
     amix_labels = ["[0:a]"]
     for idx, (start, path) in enumerate(seg_files):
