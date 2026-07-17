@@ -154,13 +154,18 @@ def ffprobe_duration(path: str) -> float:
 
 
 def get_video_resolution(path: str):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-         "-of", "csv=s=x:p=0", path],
-        capture_output=True, text=True, check=True,
-    )
-    w_str, h_str = result.stdout.strip().split("x")
-    return int(w_str), int(h_str)
+    """Trả về (width, height), hoặc None nếu ffprobe không đọc được (container/codec lạ) —
+    khi đó nơi gọi hàm này sẽ tự suy ra kích thước từ khung hình đã trích được thay thế."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+             "-of", "csv=s=x:p=0", path],
+            capture_output=True, text=True,
+        )
+        w_str, h_str = result.stdout.strip().split("x")
+        return int(w_str), int(h_str)
+    except Exception:
+        return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -521,15 +526,68 @@ def get_persistent_video_path(uploaded_file) -> str:
     return path
 
 
+def _try_grab_frame(cmd, out_path: str):
+    """Chạy 1 lệnh ffmpeg thử trích khung hình. Trả về (thành_công, stderr_text)."""
+    if os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    ok = result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    stderr_tail = "\n".join(result.stderr.strip().splitlines()[-10:]) if result.stderr else ""
+    return ok, stderr_tail
+
+
 def extract_preview_frame(video_path: str, out_path: str):
+    """Trích 1 khung hình xem trước, thử LẦN LƯỢT nhiều cách khác nhau để tối đa khả
+    năng thành công (video codec lạ, container lỗi, timestamp không seek được, v.v.).
+
+    Trả về True nếu thành công. Nếu tất cả các cách đều thất bại, trả về False và
+    lưu lại thông báo lỗi kỹ thuật của lần thử cuối vào st.session_state để hiển thị
+    cho người dùng thay vì chỉ báo lỗi chung chung.
+    """
     try:
         dur = ffprobe_duration(video_path)
-        timestamp = max(min(dur * 0.3, dur - 0.1), 0) if dur > 0.2 else 0
     except Exception:
-        timestamp = 0
-    cmd = ["ffmpeg", "-y", "-ss", f"{timestamp:.2f}", "-i", video_path,
-           "-frames:v", "1", "-q:v", "2", out_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        dur = 0
+
+    timestamps = []
+    if dur > 0.2:
+        timestamps.append(max(min(dur * 0.3, dur - 0.1), 0))
+    if 0 not in timestamps:
+        timestamps.append(0)
+
+    attempts = []
+    for ts in timestamps:
+        # 1) Input seeking - nhanh, hoạt động với hầu hết video có index tốt
+        attempts.append((f"seek nhanh @ {ts:.1f}s",
+                          ["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", video_path,
+                           "-frames:v", "1", "-q:v", "2", out_path]))
+        # 2) Output seeking - chậm hơn nhưng chịu được video có timestamp/index bất thường
+        attempts.append((f"seek chính xác @ {ts:.1f}s",
+                          ["ffmpeg", "-y", "-i", video_path, "-ss", f"{ts:.2f}",
+                           "-frames:v", "1", "-q:v", "2", out_path]))
+
+    # 3) Ép lấy khung hình đầu tiên bằng bộ lọc select, hoạt động cả khi seek lỗi
+    attempts.append(("select khung đầu tiên",
+                      ["ffmpeg", "-y", "-i", video_path, "-vf", "select=eq(n\\,0)",
+                       "-frames:v", "1", "-q:v", "2", "-vsync", "0", out_path]))
+    # 4) Chỉ định rõ track video đầu tiên, phòng trường hợp file có nhiều track/track lỗi
+    attempts.append(("map track video 0",
+                      ["ffmpeg", "-y", "-i", video_path, "-map", "0:v:0",
+                       "-frames:v", "1", "-q:v", "2", "-vsync", "0", out_path]))
+
+    last_error = "(không có thông tin lỗi)"
+    for label, cmd in attempts:
+        ok, stderr_tail = _try_grab_frame(cmd, out_path)
+        if ok:
+            return True
+        if stderr_tail:
+            last_error = f"[{label}]\n{stderr_tail}"
+
+    st.session_state["_last_preview_frame_error"] = last_error
+    return False
 
 
 def ensure_preview_frame(video_path: str):
@@ -537,17 +595,28 @@ def ensure_preview_frame(video_path: str):
         return st.session_state.preview_frame_path, st.session_state.preview_video_res
 
     frame_path = os.path.join(st.session_state.workdir, "preview_frame.jpg")
+    st.session_state["preview_frame_error"] = None
     try:
-        extract_preview_frame(video_path, frame_path)
+        ok = extract_preview_frame(video_path, frame_path)
+        if not ok:
+            raise RuntimeError(st.session_state.get("_last_preview_frame_error", "Không rõ nguyên nhân."))
+
         resolution = get_video_resolution(video_path)
+        if resolution is None:
+            # ffprobe không đọc được stream video (container/codec lạ) — vẫn có ảnh nên
+            # suy ra kích thước trực tiếp từ chính khung hình vừa trích được.
+            with Image.open(frame_path) as im:
+                resolution = im.size
+
         st.session_state.preview_frame_for = video_path
         st.session_state.preview_frame_path = frame_path
         st.session_state.preview_video_res = resolution
         return frame_path, resolution
-    except Exception:
+    except Exception as e:
         st.session_state.preview_frame_for = video_path
         st.session_state.preview_frame_path = None
         st.session_state.preview_video_res = None
+        st.session_state["preview_frame_error"] = str(e)
         return None, None
 
 
@@ -841,7 +910,16 @@ if active_video_path is not None:
     with st.spinner("Đang chuẩn bị khung hình xem trước..."):
         preview_frame_path, preview_video_res = ensure_preview_frame(persistent_video_path)
     if preview_frame_path is None:
-        st.warning("⚠️ Không trích được khung hình xem trước (file có thể lỗi) — vẫn xử lý được nhưng sẽ không có ảnh xem trước.")
+        st.warning("⚠️ Không trích được khung hình xem trước — đã thử nhiều cách nhưng đều thất bại. Vẫn xử lý được, chỉ là không xem trước được.")
+        preview_err = st.session_state.get("preview_frame_error")
+        if preview_err:
+            with st.expander("🔍 Xem chi tiết lỗi kỹ thuật (để biết vì sao)"):
+                st.code(preview_err)
+            st.caption(
+                "💡 Nguyên nhân thường gặp: file video bị hỏng/tải chưa xong, codec hiếm mà ffmpeg bản đang "
+                "dùng không hỗ trợ, hoặc file thực chất không phải video. Thử tải lại file, đổi định dạng "
+                "(vd convert sang .mp4 H.264 bằng HandBrake), hoặc kiểm tra ffmpeg đã cài đủ codec chưa."
+            )
     else:
         pw, ph = preview_video_res
         with st.spinner("🔎 Đang tự động phát hiện vùng phụ đề gốc..."):
@@ -966,6 +1044,10 @@ if active_video_path is None:
     st.info("Tải video lên ở trên để xem bản xem trước.")
 elif preview_frame_path is None:
     st.warning("Không có khung hình xem trước cho video này — vẫn xử lý được, chỉ là không kiểm tra trước được vị trí/màu sắc.")
+    preview_err = st.session_state.get("preview_frame_error")
+    if preview_err:
+        with st.expander("🔍 Xem chi tiết lỗi kỹ thuật"):
+            st.code(preview_err)
 else:
     combined_img = Image.open(preview_frame_path).convert("RGB")
     if remove_old_sub and old_sub_box is not None:
@@ -1061,7 +1143,17 @@ if start_button:
                 status.write("🎞️ Đang xử lý hình ảnh video (xoá phụ đề gốc tự động phát hiện / ghi phụ đề mới)...")
                 final_old_sub_box = None
                 if remove_old_sub:
-                    width, height = get_video_resolution(current_video)
+                    resolution = get_video_resolution(current_video)
+                    if resolution is None:
+                        # ffprobe không đọc được stream video của file gốc — dùng lại độ
+                        # phân giải đã suy ra được lúc xem trước, nếu có.
+                        resolution = st.session_state.get("preview_video_res")
+                    if resolution is None:
+                        raise FFmpegError(
+                            "Không xác định được độ phân giải video để xoá phụ đề gốc — "
+                            "file có thể bị lỗi hoặc dùng codec không được hỗ trợ."
+                        )
+                    width, height = resolution
                     if adv_manual_old_box and manual_box_pct:
                         final_old_sub_box = compute_free_box(width, height, *manual_box_pct)
                     else:
