@@ -14,6 +14,7 @@ Pillow
 numpy
 streamlit>=1.50.0
 faster-whisper
+av>=12.0.0
 deep-translator
 edge-tts
 Pillow
