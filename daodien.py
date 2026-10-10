@@ -6,10 +6,14 @@ Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI
 màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
 
 BẢN NÀY CÓ GÌ MỚI
-    - Sửa lỗi "open() got an unexpected keyword argument 'metadata_errors'":
-      app tự đọc file wav 16kHz rồi đưa thẳng mảng số cho faster-whisper, không
-      còn phụ thuộc vào hàm giải mã av.open() của thư viện PyAV nữa.
-    - Chữ trong giao diện đậm, to và tương phản cao (kể cả khi thiếu config.toml).
+    - SỬA LỖI KHÔNG DỊCH RA TIẾNG VIỆT: dịch bằng 3 nguồn dự phòng (Google trực tiếp →
+      deep_translator → MyMemory), kiểm tra kết quả thật sự là tiếng Việt, tự thử lại,
+      báo lỗi rõ ràng thay vì âm thầm giữ chữ Trung.
+    - SỬA LỖI KHÔNG LỒNG TIẾNG AI: chạy edge-tts ổn định hơn, hiển thị lỗi thật,
+      tự chuyển sang gTTS nếu edge-tts hỏng, ghép track giọng đọc bằng numpy.
+    - NHẬN DIỆN & LỌC ÂM THANH TỐT HƠN: lọc nhiễu/cân bằng âm trước khi nhận diện,
+      model mặc định "small", tham số Whisper/VAD tối ưu cho tiếng Trung, lọc câu "ảo giác",
+      gộp câu quá ngắn.
     - 12 tính năng "Viral Boost": lật gương, zoom nhẹ, tăng màu & nét, tăng tốc nhẹ,
       tiêu đề hook 3 giây đầu, watermark tên kênh, che logo góc, thanh tiến trình,
       fade vào/ra, chuẩn hoá âm lượng, khung dọc 9:16 Shorts, thumbnail tự động,
@@ -17,6 +21,7 @@ BẢN NÀY CÓ GÌ MỚI
 
 CÀI ĐẶT:
     pip install -r requirements.txt        # cần streamlit >= 1.50
+    pip install -U edge-tts gTTS deep-translator
     # cần ffmpeg: sudo apt install ffmpeg / brew install ffmpeg
 
 CHẠY:
@@ -31,13 +36,20 @@ CẤU TRÚC THƯ MỤC:
 
 import asyncio
 import hashlib
+import html as html_lib
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
+import urllib.parse
+import urllib.request
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import streamlit as st
@@ -245,12 +257,13 @@ VOICE_STYLE_OPTIONS = {
 
 POSITION_OPTIONS = {"Dưới (mặc định)": 2, "Giữa màn hình": 5, "Trên": 8}
 
+# beam_size lớn hơn = nhận diện chính xác hơn; tts_concurrency vừa phải để không bị Microsoft chặn.
 SPEED_PRESETS = {
-    "⚡ Nhanh nhất": {"beam_size": 1, "video_preset": "ultrafast", "tts_concurrency": 12},
-    "⚖️ Cân bằng": {"beam_size": 3, "video_preset": "veryfast", "tts_concurrency": 6},
-    "🎯 Chính xác nhất": {"beam_size": 5, "video_preset": "medium", "tts_concurrency": 4},
+    "⚡ Nhanh nhất": {"beam_size": 3, "video_preset": "ultrafast", "tts_concurrency": 8},
+    "⚖️ Cân bằng": {"beam_size": 5, "video_preset": "veryfast", "tts_concurrency": 6},
+    "🎯 Chính xác nhất": {"beam_size": 8, "video_preset": "medium", "tts_concurrency": 4},
 }
-DEFAULT_SPEED_LABEL = "⚡ Nhanh nhất"
+DEFAULT_SPEED_LABEL = "⚖️ Cân bằng"
 DEFAULT_POSITION_LABEL = "Dưới (mặc định)"
 
 LOGO_CORNERS = {
@@ -270,6 +283,7 @@ AUTO_BG_VOLUME_PCT = 8
 AUTO_NO_DUB_VOLUME_PCT = 100
 
 MAX_TTS_SPEEDUP = 1.15
+TTS_SAMPLE_RATE = 24000
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -307,9 +321,36 @@ def _run_ffmpeg(cmd, label: str = "ffmpeg"):
     return result
 
 
-def extract_audio(video_path: str, audio_path: str):
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path]
-    _run_ffmpeg(cmd, label="tách âm thanh")
+# Chuỗi lọc âm thanh trước khi nhận diện: cắt tiếng ù/rè thấp, cắt hiss cao, khử nhiễu nền, cân bằng âm lượng.
+AUDIO_ENHANCE_FILTERS = [
+    "highpass=f=90,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=250:g=13:p=0.9",
+    "highpass=f=90,lowpass=f=7600,dynaudnorm=f=250:g=13:p=0.9",
+]
+
+
+def extract_audio(video_path: str, audio_path: str, enhance: bool = True):
+    """Tách âm thanh 16kHz mono. Nếu enhance=True: lọc nhiễu + cân bằng âm lượng để nhận diện chính xác hơn.
+    Nếu ffmpeg thiếu bộ lọc, tự động thử bộ lọc đơn giản hơn rồi mới tới bản không lọc."""
+    if not has_audio_stream(video_path):
+        raise FFmpegError("Video này không có âm thanh nên không thể nhận diện giọng nói.")
+
+    base = ["ffmpeg", "-y", "-i", video_path, "-vn", "-map", "0:a:0"]
+    tail = ["-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path]
+
+    attempts = []
+    if enhance:
+        for af in AUDIO_ENHANCE_FILTERS:
+            attempts.append(base + ["-af", af] + tail)
+    attempts.append(base + tail)
+
+    last_err = None
+    for cmd in attempts:
+        try:
+            _run_ffmpeg(cmd, label="tách âm thanh")
+            return
+        except FFmpegError as e:
+            last_err = e
+    raise last_err
 
 
 def ffprobe_duration(path: str) -> float:
@@ -365,49 +406,185 @@ def load_wav_as_float32(path: str) -> "np.ndarray":
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 3, progress_cb=None):
+# Các câu "ảo giác" quen thuộc của Whisper khi gặp đoạn im lặng / nhạc nền.
+_HALLUCINATION_HINTS = (
+    "字幕", "订阅", "訂閱", "点赞", "點贊", "谢谢观看", "謝謝觀看", "感谢观看", "感謝觀看",
+    "请不吝", "請不吝", "Amara", "打赏", "打賞", "下集再见", "下期再见", "明镜", "明鏡",
+)
+
+
+def _is_hallucination(seg) -> bool:
+    text = seg.text.strip()
+    if not text:
+        return True
+    no_speech = getattr(seg, "no_speech_prob", 0.0) or 0.0
+    avg_lp = getattr(seg, "avg_logprob", 0.0) or 0.0
+    if no_speech > 0.8 and avg_lp < -1.0:
+        return True
+    if any(h in text for h in _HALLUCINATION_HINTS) and (no_speech > 0.4 or avg_lp < -0.8):
+        return True
+    return False
+
+
+def merge_short_segments(segs, max_gap: float = 0.35, max_len: float = 8.0, min_dur: float = 1.5):
+    """Gộp các câu quá ngắn, sát nhau để dịch đủ ngữ cảnh và giọng đọc tự nhiên hơn."""
+    out = []
+    for s in segs:
+        if out:
+            p = out[-1]
+            gap = s["start"] - p["end"]
+            p_dur = p["end"] - p["start"]
+            s_dur = s["end"] - s["start"]
+            if gap <= max_gap and (p_dur < min_dur or s_dur < min_dur * 0.6) and (s["end"] - p["start"]) <= max_len:
+                p["end"] = s["end"]
+                p["text"] = (p["text"] + s["text"]).strip()
+                continue
+        out.append(dict(s))
+    return out
+
+
+def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 5, progress_cb=None):
     model = load_whisper_model(model_size)
     audio_array = load_wav_as_float32(audio_path)
-    segments, info = model.transcribe(audio_array, language="zh", vad_filter=True, beam_size=beam_size)
+    segments, info = model.transcribe(
+        audio_array,
+        language="zh",
+        task="transcribe",
+        beam_size=beam_size,
+        best_of=5,
+        temperature=[0.0, 0.2, 0.4],
+        vad_filter=True,
+        vad_parameters=dict(threshold=0.35, min_silence_duration_ms=400,
+                            speech_pad_ms=250, min_speech_duration_ms=200),
+        condition_on_previous_text=False,       # tránh lặp câu / trôi lệch kéo dài
+        initial_prompt="以下是普通话的句子，使用简体中文。",   # gợi ý tiếng Trung giản thể, có dấu câu
+        no_speech_threshold=0.5,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+    )
+
     results = []
+    prev_text = None
     for seg in segments:
-        results.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+        if _is_hallucination(seg):
+            continue
+        text = seg.text.strip()
+        if text == prev_text and (getattr(seg, "avg_logprob", 0.0) or 0.0) < -0.6:
+            continue   # lặp lại y hệt câu trước với độ tin cậy thấp
+        prev_text = text
+        results.append({"start": seg.start, "end": seg.end, "text": text})
         if progress_cb:
-            progress_cb(seg.end, seg.text.strip())
-    return results
+            progress_cb(seg.end, text)
+
+    return merge_short_segments(results)
 
 
-def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
+# ============================================================
+# DỊCH TRUNG → VIỆT (nhiều nguồn dự phòng, có kiểm tra kết quả)
+# ============================================================
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _is_good_translation(src: str, out: str) -> bool:
+    """Kết quả dịch hợp lệ = không rỗng và thật sự không còn là chữ Trung."""
+    if not out or not out.strip():
+        return False
+    if not _CJK_RE.search(src):
+        return True
+    if out.strip() == src.strip():
+        return False
+    cjk = len(_CJK_RE.findall(out))
+    return cjk / max(len(out.strip()), 1) < 0.3
+
+
+def _tr_google_web(text: str) -> str:
+    q = urllib.parse.urlencode({"client": "gtx", "sl": "zh-CN", "tl": "vi", "dt": "t", "q": text})
+    req = urllib.request.Request(
+        "https://translate.googleapis.com/translate_a/single?" + q,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return "".join(p[0] for p in data[0] if p and p[0])
+
+
+def _tr_deep_google(text: str) -> str:
     from deep_translator import GoogleTranslator
-    translator = GoogleTranslator(source="zh-CN", target="vi")
+    return GoogleTranslator(source="zh-CN", target="vi").translate(text)
 
-    texts = [seg["text"] for seg in segments]
-    translated_all = [None] * len(segments)
 
+def _tr_mymemory(text: str) -> str:
+    q = urllib.parse.urlencode({"q": text[:480], "langpair": "zh-CN|vi"})
+    req = urllib.request.Request("https://api.mymemory.translated.net/get?" + q,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    out = (data.get("responseData") or {}).get("translatedText", "")
+    if not out or "MYMEMORY WARNING" in out.upper() or "INVALID" in out.upper():
+        raise RuntimeError(out or "MyMemory không trả kết quả")
+    return out
+
+
+_TRANSLATE_BACKENDS = (_tr_google_web, _tr_deep_google, _tr_mymemory)
+
+
+def _translate_one(text: str, errors: list):
+    """Dịch 1 câu, thử lần lượt các nguồn. Trả về None nếu tất cả đều thất bại."""
+    if not text.strip():
+        return text
+    for fn in _TRANSLATE_BACKENDS:
+        for attempt in range(2):
+            try:
+                out = html_lib.unescape((fn(text) or "").strip())
+                if _is_good_translation(text, out):
+                    return out
+                errors.append(f"{fn.__name__}: kết quả không phải tiếng Việt")
+                break
+            except Exception as e:
+                errors.append(f"{fn.__name__}: {type(e).__name__}: {e}")
+                time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def translate_segments(segments, progress_cb=None, workers: int = 8):
+    """Dịch toàn bộ câu sang tiếng Việt (song song). Câu nào dịch hỏng sẽ có translated_ok=False.
+    Nếu hỏng toàn bộ → raise lỗi có nguyên nhân cụ thể (không âm thầm giữ chữ Trung nữa)."""
+    n = len(segments)
+    errors = []
+    results = [None] * n
     done = 0
-    for start in range(0, len(texts), chunk_size):
-        chunk = texts[start:start + chunk_size]
-        try:
-            batch_result = translator.translate_batch(chunk)
-        except Exception:
-            batch_result = None
 
-        if batch_result and len(batch_result) == len(chunk):
-            for i, t in enumerate(batch_result):
-                translated_all[start + i] = t if t else chunk[i]
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(_translate_one, seg["text"], errors): i for i, seg in enumerate(segments)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+                results[i] = None
+            done += 1
+            if progress_cb:
+                progress_cb(done, n)
+
+    ok_count = 0
+    for seg, tr in zip(segments, results):
+        if tr:
+            seg["translated"] = tr
+            seg["translated_ok"] = True
+            ok_count += 1
         else:
-            for i, text in enumerate(chunk):
-                try:
-                    translated_all[start + i] = translator.translate(text)
-                except Exception:
-                    translated_all[start + i] = text
+            seg["translated"] = seg["text"]
+            seg["translated_ok"] = False
 
-        done = min(start + chunk_size, len(texts))
-        if progress_cb:
-            progress_cb(done, len(texts))
-
-    for seg, translated in zip(segments, translated_all):
-        seg["translated"] = translated if translated else seg["text"]
+    if n and ok_count == 0:
+        last = errors[-1] if errors else "không rõ nguyên nhân"
+        raise RuntimeError(
+            "Không dịch được câu nào sang tiếng Việt — thường do máy không có Internet hoặc bị chặn "
+            "truy cập dịch vụ dịch. Hãy kiểm tra kết nối mạng rồi thử lại.\n"
+            f"Chi tiết lỗi cuối: {last}"
+        )
     return segments
 
 
@@ -1182,24 +1359,51 @@ def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, o
 # ============================================================
 
 def _run_async(coro):
-    try:
-        asyncio.run(coro)
-    except RuntimeError:
+    """Chạy coroutine trong một thread riêng với event loop mới (ổn định trong Streamlit,
+    không bao giờ đụng loop đang chạy). Thread được gắn ngữ cảnh Streamlit để progress bar cập nhật được."""
+    box = {}
+
+    def runner():
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(coro)
+            asyncio.set_event_loop(loop)
+            box["value"] = loop.run_until_complete(coro)
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
         finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
             loop.close()
+
+    t = threading.Thread(target=runner, daemon=True)
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            add_script_run_ctx(t, ctx)
+    except Exception:
+        pass
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
                         max_retries: int = 3, concurrency: int = 6, progress_cb=None):
-    import edge_tts
+    """Tạo giọng đọc bằng edge-tts. Trả về (tập chỉ số câu lỗi, thông báo lỗi cuối cùng)."""
+    all_idx = {idx for idx, _, _ in items}
+    try:
+        import edge_tts
+    except ImportError:
+        return all_idx, "Chưa cài thư viện edge-tts (pip install -U edge-tts)."
 
     failed_indices = set()
+    errors = []
     done_count = 0
-    lock = asyncio.Lock()
 
     async def _synthesize_one(sem, idx, text, raw_path):
         nonlocal done_count
@@ -1212,121 +1416,185 @@ def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
                     if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
                         success = True
                         break
-                except Exception:
-                    await asyncio.sleep(0.6)
+                    errors.append("edge-tts trả về file rỗng")
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{type(e).__name__}: {e}")
+                await asyncio.sleep(0.8 * (attempt + 1))
             if not success:
                 failed_indices.add(idx)
-        async with lock:
-            done_count += 1
-            if progress_cb:
+        done_count += 1
+        if progress_cb:
+            try:
                 progress_cb(done_count, len(items))
+            except Exception:
+                pass
 
     async def _synthesize_all():
         sem = asyncio.Semaphore(concurrency)
         await asyncio.gather(*[_synthesize_one(sem, idx, text, raw_path) for idx, text, raw_path in items])
 
-    _run_async(_synthesize_all())
-    return failed_indices
+    try:
+        _run_async(_synthesize_all())
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"{type(e).__name__}: {e}")
+        failed_indices = set(all_idx)
+
+    last_error = errors[-1] if errors else ""
+    return failed_indices, last_error
+
+
+def _gtts_fallback(items):
+    """Dự phòng: dùng gTTS (Google Translate TTS, giọng Việt) cho các câu edge-tts không tạo được.
+    Trả về (tập chỉ số vẫn lỗi, thông báo lỗi)."""
+    try:
+        from gtts import gTTS
+    except ImportError:
+        return {idx for idx, _, _ in items}, "Chưa cài gTTS (pip install gTTS) nên không có giọng dự phòng."
+
+    errors = []
+
+    def _one(item):
+        idx, text, raw_path = item
+        for attempt in range(2):
+            try:
+                gTTS(text=text, lang="vi").save(raw_path)
+                if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                    return idx, True
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"gTTS {type(e).__name__}: {e}")
+                time.sleep(0.8)
+        return idx, False
+
+    still_failed = set()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for idx, ok in ex.map(_one, items):
+            if not ok:
+                still_failed.add(idx)
+    return still_failed, (errors[-1] if errors else "")
 
 
 def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
     """Khớp audio TTS vào khung thời gian của câu, tăng tốc tối đa MAX_TTS_SPEEDUP lần
     để giọng đọc luôn tự nhiên; phần tràn được xử lý ở build_dub_track() (không chồng tiếng)."""
     dur = ffprobe_duration(in_path)
+    base = ["ffmpeg", "-y", "-i", in_path]
+    tail = ["-ar", str(TTS_SAMPLE_RATE), "-ac", "1", out_path]
+    quiet = dict(check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     if dur <= target_duration or target_duration <= 0:
-        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(base + tail, **quiet)
         return
 
-    factor = dur / target_duration
-    factor = min(factor, MAX_TTS_SPEEDUP)
-
+    factor = min(dur / target_duration, MAX_TTS_SPEEDUP)
     if factor <= 1.02:
-        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(base + tail, **quiet)
         return
 
-    subprocess.run(["ffmpeg", "-y", "-i", in_path, "-filter:a", f"atempo={factor:.3f}", "-ar", "24000", "-ac", "1", out_path],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(base + ["-filter:a", f"atempo={factor:.3f}"] + tail, **quiet)
 
 
 def make_silence(out_path: str, duration: float):
     duration = max(duration, 0.1)
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={duration}", out_path],
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r={TTS_SAMPLE_RATE}:cl=mono:d={duration}", out_path],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
+def _read_wav_mono_float(path: str) -> "np.ndarray":
+    with wave.open(path, "rb") as wf:
+        nch = wf.getnchannels()
+        raw = wf.readframes(wf.getnframes())
+    arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if nch > 1:
+        arr = arr.reshape(-1, nch).mean(axis=1)
+    return arr
+
+
 def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
                      tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None):
+    """Trả về (đường dẫn track lồng tiếng hoặc None nếu không tạo được câu nào, tập câu lỗi, thông báo lỗi)."""
     items = []
     for i, seg in enumerate(segments):
         text = seg["translated"].strip()
-        if text:
+        # Câu chưa dịch được (vẫn là chữ Trung) thì không đưa cho giọng Việt đọc.
+        if text and seg.get("translated_ok", True):
             raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
             items.append((i, text, raw_path))
 
-    failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch,
-                                         concurrency=concurrency, progress_cb=progress_cb)
+    if not items:
+        return None, set(), "Không có câu nào đã được dịch sang tiếng Việt để lồng tiếng."
+
+    failed_indices, last_error = synthesize_all_tts(items, voice, rate, volume, pitch,
+                                                     concurrency=concurrency, progress_cb=progress_cb)
+
+    # Edge-tts hỏng câu nào → thử gTTS cho câu đó.
+    if failed_indices:
+        retry_items = [it for it in items if it[0] in failed_indices]
+        failed_indices, gtts_err = _gtts_fallback(retry_items)
+        if failed_indices and gtts_err:
+            last_error = f"{last_error} | {gtts_err}" if last_error else gtts_err
+
+    if len(failed_indices) >= len(items):
+        hint = (" Gợi ý: chạy 'pip install -U edge-tts gTTS' và kiểm tra kết nối Internet.")
+        return None, failed_indices, (last_error or "Không rõ nguyên nhân") + hint
 
     # Chống chồng tiếng: câu sau không bao giờ bắt đầu sớm hơn thời điểm câu trước kết thúc ("cursor").
-    seg_files = []
+    placed = []   # (start_time, numpy audio)
     cursor = 0.0
     for idx, text, raw_path in items:
+        if idx in failed_indices:
+            continue
         seg = segments[idx]
         slot_duration = max(seg["end"] - seg["start"], 0.3)
         fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
-
-        if idx in failed_indices:
-            make_silence(fit_path, slot_duration)
-            actual_dur = slot_duration
-        else:
+        try:
             fit_audio_to_duration(raw_path, fit_path, slot_duration)
-            try:
-                actual_dur = ffprobe_duration(fit_path)
-            except Exception:
-                actual_dur = slot_duration
-
+            audio = _read_wav_mono_float(fit_path)
+        except Exception:
+            failed_indices.add(idx)
+            continue
+        actual_dur = len(audio) / TTS_SAMPLE_RATE
         actual_start = max(seg["start"], cursor)
         cursor = actual_start + actual_dur
-
-        seg_files.append((actual_start, fit_path))
+        placed.append((actual_start, audio))
 
     dub_track_duration = max(total_duration, cursor)
+    track = np.zeros(int(dub_track_duration * TTS_SAMPLE_RATE) + TTS_SAMPLE_RATE, dtype=np.float32)
+    for start, audio in placed:
+        s = int(start * TTS_SAMPLE_RATE)
+        e = s + len(audio)
+        if e > len(track):
+            track = np.pad(track, (0, e - len(track)))
+        track[s:e] += audio
+    track = np.clip(track, -1.0, 1.0)
 
     dub_track_path = os.path.join(tmp_dir, "dub_track.wav")
-    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={dub_track_duration}"]
-    filter_parts = []
-    amix_labels = ["[0:a]"]
-    for idx, (start, path) in enumerate(seg_files):
-        inputs += ["-i", path]
-        delay_ms = int(start * 1000)
-        filter_parts.append(f"[{idx + 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
-        amix_labels.append(f"[a{idx}]")
-
-    filter_complex = ";".join(filter_parts)
-    if filter_complex:
-        filter_complex += ";"
-    filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
-
-    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
-    _run_ffmpeg(cmd, label="ghép các đoạn giọng đọc AI thành 1 track")
-    return dub_track_path, failed_indices
+    with wave.open(dub_track_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(TTS_SAMPLE_RATE)
+        wf.writeframes((track * 32767.0).astype(np.int16).tobytes())
+    return dub_track_path, failed_indices, last_error
 
 
 def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str,
                             keep_bg: bool, bg_volume: float = 0.08):
+    if keep_bg and not has_audio_stream(video_path):
+        keep_bg = False   # video gốc không có tiếng nền để giữ
+
     if keep_bg:
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
             "-filter_complex", f"[0:a]volume={bg_volume}[bg];[1:a]anull[dub];[bg][dub]amix=inputs=2:duration=first:normalize=0[aout]",
-            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-shortest", output_path,
+            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest", output_path,
         ]
     else:
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
-            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-shortest", output_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest", output_path,
         ]
     _run_ffmpeg(cmd, label="ghép giọng lồng tiếng AI vào video")
 
@@ -1346,7 +1614,7 @@ def tts_preview_fragment(label: str, voice: str, rate: str, volume: str, pitch: 
                 with open(tts_preview_path, "rb") as f:
                     st.session_state.tts_preview_bytes = f.read()
             except Exception as e:
-                st.error(f"Không tạo được giọng đọc mẫu: {e}")
+                st.error(f"Không tạo được giọng đọc mẫu: {e}  — thử chạy: pip install -U edge-tts")
                 st.session_state.tts_preview_bytes = None
     if st.session_state.get("tts_preview_bytes"):
         st.audio(st.session_state.tts_preview_bytes, format="audio/mp3")
@@ -1523,7 +1791,16 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
                                    disabled=not adv_override_bg_volume)
 
     st.divider()
-    adv_model_size = st.selectbox("Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=1)
+    adv_enhance_audio = st.toggle(
+        "Lọc nhiễu & cân bằng âm thanh trước khi nhận diện", value=True,
+        help="Cắt tiếng ù/rè, khử nhiễu nền và cân bằng âm lượng để nhận diện giọng nói chính xác hơn. "
+             "Chỉ ảnh hưởng bước nhận diện, không đổi âm thanh của video kết quả.",
+    )
+    adv_model_size = st.selectbox(
+        "Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=2,
+        help="Model lớn hơn nhận diện chính xác hơn nhưng chậm hơn. 'small' là mức khởi điểm tốt cho tiếng Trung; "
+             "video nhiều tạp âm/nhạc nền nên chọn 'medium' hoặc 'large-v3'.",
+    )
     adv_speed_label = st.segmented_control(
         "Tốc độ xử lý", list(SPEED_PRESETS.keys()), default=DEFAULT_SPEED_LABEL, selection_mode="single",
     ) or DEFAULT_SPEED_LABEL
@@ -1645,14 +1922,16 @@ if start_button:
         thumb_bytes = None
         pack_text = None
         dub_warning_count = 0
+        dub_error = None
+        untranslated_count = 0
 
         try:
             with status:
-                st.write("🔊 Đang tách âm thanh...")
-                extract_audio(input_path, audio_path)
+                st.write("🔊 Đang tách & lọc nhiễu âm thanh..." if adv_enhance_audio else "🔊 Đang tách âm thanh...")
+                extract_audio(input_path, audio_path, enhance=adv_enhance_audio)
                 total_duration = ffprobe_duration(input_path)
 
-                st.write("🗣️ Đang nhận diện giọng nói tiếng Trung...")
+                st.write(f"🗣️ Đang nhận diện giọng nói tiếng Trung (model {model_size})...")
                 transcribe_placeholder = st.empty()
                 segments = transcribe_audio(
                     audio_path, model_size, beam_size=speed_cfg["beam_size"],
@@ -1661,14 +1940,17 @@ if start_button:
 
                 if not segments:
                     status.update(label="Không nhận diện được giọng nói nào.", state="error")
+                    st.error("Không nhận diện được giọng nói nào. Thử chọn model lớn hơn (medium / large-v3) "
+                             "trong '⚙️ Tuỳ chỉnh nâng cao', hoặc kiểm tra video có lời nói tiếng Trung rõ ràng.")
                     st.stop()
                 st.write(f"✅ Nhận diện xong {len(segments)} câu.")
 
-                st.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
+                st.write("🌐 Đang dịch sang tiếng Việt...")
                 translate_bar = st.progress(0, text="Đang dịch...")
                 segments = translate_segments(
                     segments, progress_cb=lambda d, t: translate_bar.progress(d / t, text=f"Đã dịch {d}/{t} câu")
                 )
+                untranslated_count = sum(1 for s in segments if not s.get("translated_ok", True))
 
                 srt_content = build_srt(segments, bilingual=bilingual)
                 with open(srt_path, "w", encoding="utf-8") as f:
@@ -1725,18 +2007,23 @@ if start_button:
                     volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
                     pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
 
-                    dub_track_path, failed_indices = build_dub_track(
+                    dub_track_path, failed_indices, tts_error = build_dub_track(
                         segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
                         concurrency=speed_cfg["tts_concurrency"],
                         progress_cb=lambda d, t: tts_bar.progress(d / t, text=f"Đã đọc {d}/{t} câu")
                     )
                     dub_warning_count = len(failed_indices)
 
-                    st.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
-                    dub_output = os.path.join(tmp_dir, "with_dub.mp4")
-                    combine_video_with_dub(current_video, dub_track_path, dub_output,
-                                            keep_bg=keep_bg, bg_volume=original_volume_factor)
-                    current_video = dub_output
+                    if dub_track_path is None:
+                        # Không tạo được giọng đọc nào → giữ nguyên âm thanh gốc, báo lỗi rõ ràng sau khi xong.
+                        dub_error = tts_error
+                        st.write("⚠️ Không tạo được giọng lồng tiếng — giữ nguyên âm thanh gốc.")
+                    else:
+                        st.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
+                        dub_output = os.path.join(tmp_dir, "with_dub.mp4")
+                        combine_video_with_dub(current_video, dub_track_path, dub_output,
+                                                keep_bg=keep_bg, bg_volume=original_volume_factor)
+                        current_video = dub_output
                 elif original_volume_factor != 1.0:
                     st.write("🔊 Đang điều chỉnh âm lượng video gốc...")
                     vol_output = os.path.join(tmp_dir, "with_volume.mp4")
@@ -1786,10 +2073,20 @@ if start_button:
             st.error(f"❌ Lỗi không mong muốn: {e}")
             st.stop()
 
-        if dub_warning_count > 0:
+        if dub_error:
+            st.error(
+                "❌ Không tạo được giọng lồng tiếng AI tiếng Việt nên video đang giữ nguyên âm thanh gốc.\n\n"
+                f"Nguyên nhân: {dub_error}"
+            )
+        elif dub_warning_count > 0:
             st.warning(
                 f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
                 "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
+            )
+        if untranslated_count > 0:
+            st.warning(
+                f"⚠️ {untranslated_count} câu không dịch được sang tiếng Việt (có thể do mạng chập chờn) — "
+                "các câu này giữ nguyên chữ Trung trong phụ đề và không được lồng tiếng."
             )
         for note in finish_notes:
             st.warning(f"⚠️ {note}")
