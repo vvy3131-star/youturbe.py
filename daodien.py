@@ -1,9 +1,19 @@
 """
-Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ (giao diện mới, Streamlit hiện đại).
+Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ + VIRAL BOOST.
 
 Người dùng chỉ cần: tải video → chọn cỡ chữ → chọn màu chữ → chọn giọng đọc.
 Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI, hạ âm lượng gốc,
 màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
+
+BẢN NÀY CÓ GÌ MỚI
+    - Sửa lỗi "open() got an unexpected keyword argument 'metadata_errors'":
+      app tự đọc file wav 16kHz rồi đưa thẳng mảng số cho faster-whisper, không
+      còn phụ thuộc vào hàm giải mã av.open() của thư viện PyAV nữa.
+    - Chữ trong giao diện đậm, to và tương phản cao (kể cả khi thiếu config.toml).
+    - 12 tính năng "Viral Boost": lật gương, zoom nhẹ, tăng màu & nét, tăng tốc nhẹ,
+      tiêu đề hook 3 giây đầu, watermark tên kênh, che logo góc, thanh tiến trình,
+      fade vào/ra, chuẩn hoá âm lượng, khung dọc 9:16 Shorts, thumbnail tự động,
+      gói YouTube (tiêu đề / mô tả / chương / hashtag).
 
 CÀI ĐẶT:
     pip install -r requirements.txt        # cần streamlit >= 1.50
@@ -15,20 +25,23 @@ CHẠY:
 CẤU TRÚC THƯ MỤC:
     app.py
     requirements.txt
-    packages.txt                (Streamlit Cloud: ffmpeg)
+    packages.txt                (Streamlit Cloud: ffmpeg, fonts-dejavu-core)
     .streamlit/config.toml      (theme tối + nâng giới hạn upload lên 2GB)
 """
 
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
+import wave
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 st.set_page_config(
     page_title="Dịch & Lồng tiếng video Trung → Việt",
@@ -38,15 +51,17 @@ st.set_page_config(
 )
 
 # ============================================================
-# GIAO DIỆN (CSS)
+# GIAO DIỆN (CSS) — chữ to, đậm, tương phản cao
 # ============================================================
 APP_CSS = """
 <style>
 :root{
   --accent:#8b5cf6; --accent2:#22d3ee; --accent3:#f472b6;
-  --card:rgba(255,255,255,.045); --card-border:rgba(255,255,255,.10);
-  --muted:#9aa4c7;
+  --card:rgba(255,255,255,.055); --card-border:rgba(255,255,255,.14);
+  --text:#f4f6ff; --muted:#c9d1ee;
+  color-scheme: dark;
 }
+html, body, .stApp{color:var(--text); font-size:17px;}
 .stApp{
   background:
     radial-gradient(900px 500px at 8% -5%, rgba(139,92,246,.28), transparent 60%),
@@ -56,13 +71,46 @@ APP_CSS = """
   background-attachment: fixed;
 }
 header[data-testid="stHeader"]{background:transparent;}
-.block-container{max-width:860px; padding-top:2rem; padding-bottom:4rem;}
+.block-container{max-width:880px; padding-top:2rem; padding-bottom:4rem;}
+
+/* ----- Chữ: ép màu sáng + cỡ to để luôn dễ đọc, kể cả khi Streamlit đang ở theme sáng ----- */
+.stApp p, .stApp li, .stApp label, .stApp span,
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMarkdownContainer"] *{
+  color:var(--text);
+}
+.stApp [data-testid="stWidgetLabel"] p, .stApp [data-testid="stWidgetLabel"] label{
+  font-size:1.05rem !important; font-weight:650 !important; color:#ffffff !important;
+}
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] p{
+  color:var(--muted) !important; font-size:.95rem !important; line-height:1.5;
+}
+.stApp [data-testid="stTooltipIcon"] svg{color:var(--accent2) !important;}
+.stApp [data-testid="stExpander"] summary p{font-size:1.08rem !important; font-weight:650 !important; color:#fff !important;}
+.stApp .stTabs [data-baseweb="tab"] p{font-size:1.02rem !important; font-weight:650 !important;}
+.stApp [data-testid="stButtonGroup"] button p{font-size:.98rem !important; font-weight:600 !important;}
+.stApp [data-testid="stMetricValue"]{color:#fff !important; font-weight:700;}
+.stApp [data-testid="stMetricLabel"] p{color:var(--muted) !important; font-size:.92rem !important;}
+.stApp [data-testid="stSliderThumbValue"]{color:#fff !important; font-weight:700;}
+.stApp [data-testid="stSliderTickBarMin"], .stApp [data-testid="stSliderTickBarMax"]{color:var(--muted) !important;}
+
+/* ----- Ô nhập liệu / dropdown: nền tối, chữ trắng ----- */
+.stApp [data-baseweb="input"] > div, .stApp [data-baseweb="base-input"],
+.stApp [data-baseweb="select"] > div, .stApp [data-baseweb="textarea"]{
+  background:rgba(255,255,255,.08) !important; border-color:rgba(255,255,255,.25) !important; border-radius:12px !important;
+}
+.stApp input, .stApp textarea, .stApp [data-baseweb="select"] *{
+  color:#ffffff !important; -webkit-text-fill-color:#ffffff !important; font-size:1rem !important;
+}
+.stApp input::placeholder, .stApp textarea::placeholder{color:#9ea8cf !important; -webkit-text-fill-color:#9ea8cf !important;}
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] [role="listbox"]{background:#171e3d !important;}
+div[data-baseweb="popover"] li, div[data-baseweb="popover"] li *{color:#f4f6ff !important; font-size:1rem !important;}
+div[data-baseweb="popover"] li:hover{background:rgba(139,92,246,.35) !important;}
 
 /* ---------- HERO ---------- */
 .hero{
   position:relative; overflow:hidden; border-radius:26px; padding:34px 30px 28px;
-  background:linear-gradient(135deg, rgba(139,92,246,.35), rgba(34,211,238,.18) 55%, rgba(244,114,182,.22));
-  border:1px solid rgba(255,255,255,.14);
+  background:linear-gradient(135deg, rgba(139,92,246,.38), rgba(34,211,238,.20) 55%, rgba(244,114,182,.24));
+  border:1px solid rgba(255,255,255,.18);
   box-shadow:0 20px 60px -20px rgba(139,92,246,.55);
   margin-bottom:1.4rem;
 }
@@ -71,86 +119,88 @@ header[data-testid="stHeader"]{background:transparent;}
   background:radial-gradient(circle, rgba(255,255,255,.18), transparent 65%);
 }
 .hero .badge{
-  display:inline-block; font-size:.74rem; letter-spacing:.08em; text-transform:uppercase; font-weight:700;
-  padding:5px 12px; border-radius:999px; background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.2);
-  margin-bottom:12px;
+  display:inline-block; font-size:.78rem; letter-spacing:.08em; text-transform:uppercase; font-weight:800;
+  padding:5px 12px; border-radius:999px; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.28);
+  margin-bottom:12px; color:#fff;
 }
 .hero h1{
-  margin:0 0 8px; font-size:2.15rem; line-height:1.15; font-weight:800; letter-spacing:-.02em;
-  background:linear-gradient(90deg,#fff,#c4b5fd 45%,#67e8f9); -webkit-background-clip:text; background-clip:text; color:transparent;
+  margin:0 0 10px; font-size:2.3rem; line-height:1.15; font-weight:800; letter-spacing:-.02em;
+  background:linear-gradient(90deg,#fff,#d8ccff 45%,#8bf0ff); -webkit-background-clip:text; background-clip:text;
+  color:transparent !important; -webkit-text-fill-color:transparent;
 }
-.hero p{margin:0; color:#d5dbf5; font-size:1rem; max-width:620px;}
+.hero p{margin:0; color:#e6eaff !important; font-size:1.05rem; max-width:640px; line-height:1.55;}
 .hero .chips{display:flex; flex-wrap:wrap; gap:8px; margin-top:16px;}
 .hero .chip{
-  font-size:.82rem; padding:6px 12px; border-radius:999px;
-  background:rgba(8,12,28,.45); border:1px solid rgba(255,255,255,.16);
+  font-size:.9rem; font-weight:600; padding:7px 13px; border-radius:999px; color:#fff !important;
+  background:rgba(8,12,28,.55); border:1px solid rgba(255,255,255,.22);
 }
 
-/* ---------- CARD (st.container(key="card_...")) ---------- */
+/* ---------- CARD ---------- */
 [class*="st-key-card_"]{
   background:var(--card); border:1px solid var(--card-border); border-radius:22px;
   padding:22px 22px 18px; margin-bottom:1.1rem;
   backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
   box-shadow:0 10px 34px -18px rgba(0,0,0,.7);
-  transition:border-color .25s ease, transform .25s ease;
+  transition:border-color .25s ease;
 }
-[class*="st-key-card_"]:hover{border-color:rgba(139,92,246,.45);}
+[class*="st-key-card_"]:hover{border-color:rgba(139,92,246,.5);}
 
-.step-head{display:flex; align-items:center; gap:14px; margin-bottom:6px;}
+.step-head{display:flex; align-items:center; gap:14px; margin-bottom:10px;}
 .step-num{
-  flex:0 0 auto; width:38px; height:38px; border-radius:12px; display:grid; place-items:center;
-  font-weight:800; color:#fff; background:linear-gradient(135deg,var(--accent),var(--accent2));
+  flex:0 0 auto; width:42px; height:42px; border-radius:13px; display:grid; place-items:center;
+  font-weight:800; font-size:1.1rem; color:#fff; background:linear-gradient(135deg,var(--accent),var(--accent2));
   box-shadow:0 8px 20px -6px rgba(139,92,246,.7);
 }
-.step-title{font-size:1.2rem; font-weight:700; margin:0; line-height:1.2;}
-.step-desc{color:var(--muted); font-size:.9rem; margin:2px 0 0;}
+.step-title{font-size:1.35rem; font-weight:800; margin:0; line-height:1.2; color:#fff !important;}
+.step-desc{color:var(--muted) !important; font-size:.98rem; margin:3px 0 0;}
 
 /* ---------- WIDGETS ---------- */
 [data-testid="stFileUploaderDropzone"]{
-  border:2px dashed rgba(139,92,246,.55); border-radius:18px; padding:26px;
-  background:linear-gradient(135deg, rgba(139,92,246,.10), rgba(34,211,238,.06));
+  border:2px dashed rgba(139,92,246,.65); border-radius:18px; padding:26px;
+  background:linear-gradient(135deg, rgba(139,92,246,.12), rgba(34,211,238,.07));
   transition:all .25s ease;
 }
 [data-testid="stFileUploaderDropzone"]:hover{
-  border-color:var(--accent2); background:linear-gradient(135deg, rgba(139,92,246,.18), rgba(34,211,238,.12));
+  border-color:var(--accent2); background:linear-gradient(135deg, rgba(139,92,246,.2), rgba(34,211,238,.13));
 }
+[data-testid="stFileUploaderDropzone"] *{color:#f4f6ff !important;}
 .stButton>button, .stDownloadButton>button{
-  border-radius:14px; font-weight:700; padding:.65rem 1.1rem; transition:all .2s ease;
-  border:1px solid rgba(255,255,255,.16);
+  border-radius:14px; font-weight:700; font-size:1rem; padding:.7rem 1.1rem; transition:all .2s ease;
+  border:1px solid rgba(255,255,255,.22);
 }
 .stButton>button:hover, .stDownloadButton>button:hover{
   transform:translateY(-2px); border-color:var(--accent2); box-shadow:0 10px 24px -10px rgba(34,211,238,.6);
 }
-.stButton>button[kind="primary"]{
-  border:none; color:#fff; font-size:1.08rem; padding:.9rem 1.2rem;
+.stButton>button[kind="primary"], .stDownloadButton>button[kind="primary"]{
+  border:none; color:#fff; font-size:1.12rem; padding:.95rem 1.2rem;
   background:linear-gradient(90deg,#8b5cf6,#6366f1 50%,#22d3ee);
   box-shadow:0 14px 34px -12px rgba(99,102,241,.9);
 }
 .stButton>button[kind="primary"]:hover{filter:brightness(1.1); box-shadow:0 18px 40px -12px rgba(34,211,238,.8);}
 .stButton>button:disabled{opacity:.45; transform:none; box-shadow:none;}
 [data-testid="stImage"] img, [data-testid="stVideo"] video{
-  border-radius:16px; border:1px solid rgba(255,255,255,.12); box-shadow:0 18px 40px -22px #000;
+  border-radius:16px; border:1px solid rgba(255,255,255,.14); box-shadow:0 18px 40px -22px #000;
 }
 [data-testid="stMetric"]{
-  background:rgba(255,255,255,.05); border:1px solid var(--card-border); border-radius:16px; padding:12px 16px;
+  background:rgba(255,255,255,.06); border:1px solid var(--card-border); border-radius:16px; padding:12px 16px;
 }
-[data-testid="stMetricLabel"]{color:var(--muted);}
-[data-testid="stExpander"]{border-radius:16px; border:1px solid var(--card-border); background:rgba(255,255,255,.03);}
-[data-testid="stStatusWidget"], [data-testid="stStatus"]{border-radius:16px;}
+[data-testid="stExpander"]{border-radius:16px; border:1px solid var(--card-border); background:rgba(255,255,255,.035);}
+[data-testid="stStatus"]{border-radius:16px;}
 .stTabs [data-baseweb="tab-list"]{gap:6px;}
-.stTabs [data-baseweb="tab"]{border-radius:12px 12px 0 0; padding:.5rem 1rem;}
-.hint{color:var(--muted); font-size:.85rem;}
-.legend{
-  display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 2px;
-}
+.stTabs [data-baseweb="tab"]{border-radius:12px 12px 0 0; padding:.55rem 1rem;}
+.legend{display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 2px;}
 .legend span{
-  font-size:.8rem; padding:5px 11px; border-radius:999px; background:rgba(255,255,255,.06);
-  border:1px solid var(--card-border); color:#cfd6f3;
+  font-size:.88rem; font-weight:600; padding:6px 12px; border-radius:999px; background:rgba(255,255,255,.08);
+  border:1px solid var(--card-border); color:#f4f6ff !important;
 }
-.footer{text-align:center; color:var(--muted); font-size:.8rem; margin-top:2rem;}
+.note{
+  font-size:.92rem; color:#ffe9a8 !important; background:rgba(255,200,60,.10);
+  border:1px solid rgba(255,200,60,.35); border-radius:12px; padding:9px 13px; margin-top:8px;
+}
+.footer{text-align:center; color:var(--muted) !important; font-size:.85rem; margin-top:2rem;}
 
 @media (max-width:640px){
-  .hero{padding:24px 18px;} .hero h1{font-size:1.6rem;}
+  .hero{padding:24px 18px;} .hero h1{font-size:1.65rem;}
   [class*="st-key-card_"]{padding:16px 14px 12px;}
 }
 </style>
@@ -158,7 +208,7 @@ header[data-testid="stHeader"]{background:transparent;}
 st.html(APP_CSS)
 
 
-def step_header(num: int, title: str, desc: str = ""):
+def step_header(num, title: str, desc: str = ""):
     desc_html = f'<p class="step-desc">{desc}</p>' if desc else ""
     st.html(
         f'<div class="step-head"><div class="step-num">{num}</div>'
@@ -171,12 +221,12 @@ st.html("""
   <span class="badge">AI · Video Studio</span>
   <h1>Dịch & lồng tiếng video<br>Trung → Việt</h1>
   <p>Tải video lên, chọn vài tuỳ chọn — phần còn lại AI lo: nhận diện giọng nói, dịch, che phụ đề gốc,
-  ghi phụ đề mới và lồng tiếng Việt.</p>
+  ghi phụ đề mới, lồng tiếng Việt và tăng sức hút cho video.</p>
   <div class="chips">
     <span class="chip">🔎 Tự phát hiện phụ đề gốc</span>
-    <span class="chip">🌐 Dịch tự động</span>
     <span class="chip">🎙️ Lồng tiếng AI</span>
-    <span class="chip">🔉 Tự cân bằng âm lượng</span>
+    <span class="chip">🚀 Viral Boost</span>
+    <span class="chip">🖼️ Thumbnail & mô tả YouTube</span>
   </div>
 </div>
 """)
@@ -203,6 +253,14 @@ SPEED_PRESETS = {
 DEFAULT_SPEED_LABEL = "⚡ Nhanh nhất"
 DEFAULT_POSITION_LABEL = "Dưới (mặc định)"
 
+LOGO_CORNERS = {
+    "Không che": None,
+    "↖ Trên trái": "tl",
+    "↗ Trên phải": "tr",
+    "↙ Dưới trái": "bl",
+    "↘ Dưới phải": "br",
+}
+
 CPU_COUNT = os.cpu_count() or 4
 
 SAMPLE_SUBTITLE_TEXT = "Đây là câu phụ đề mẫu để xem trước"
@@ -211,12 +269,29 @@ SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe th
 AUTO_BG_VOLUME_PCT = 8
 AUTO_NO_DUB_VOLUME_PCT = 100
 
-# Giới hạn tăng tốc audio TTS khi ép khớp khung thời gian phụ đề (xem fit_audio_to_duration).
 MAX_TTS_SPEEDUP = 1.15
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+
+def find_font_path():
+    for c in FONT_CANDIDATES:
+        if os.path.exists(c):
+            return c
+    return None
 
 
 # ============================================================
-# CÁC HÀM XỬ LÝ CHUNG (logic giữ nguyên)
+# CÁC HÀM XỬ LÝ CHUNG
 # ============================================================
 
 class FFmpegError(RuntimeError):
@@ -245,6 +320,18 @@ def ffprobe_duration(path: str) -> float:
     return float(result.stdout.strip())
 
 
+def has_audio_stream(path: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+        return "audio" in r.stdout
+    except Exception:
+        return False
+
+
 def get_video_resolution(path: str):
     """Trả về (width, height), hoặc None nếu ffprobe không đọc được."""
     try:
@@ -265,9 +352,23 @@ def load_whisper_model(model_size: str):
     return WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=CPU_COUNT)
 
 
+def load_wav_as_float32(path: str) -> "np.ndarray":
+    """Đọc file wav 16kHz mono (do ffmpeg tạo) thành mảng float32 [-1, 1].
+
+    SỬA LỖI "open() got an unexpected keyword argument 'metadata_errors'":
+    lỗi này xảy ra vì faster-whisper gọi av.open(..., metadata_errors=...) khi đưa vào
+    đường dẫn file, mà bản PyAV cài trên máy quá cũ không có tham số đó. Ở đây ta đã có
+    sẵn wav chuẩn từ ffmpeg nên đọc trực tiếp và truyền mảng numpy — bỏ qua hoàn toàn PyAV.
+    """
+    with wave.open(path, "rb") as wf:
+        raw = wf.readframes(wf.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 3, progress_cb=None):
     model = load_whisper_model(model_size)
-    segments, info = model.transcribe(audio_path, language="zh", vad_filter=True, beam_size=beam_size)
+    audio_array = load_wav_as_float32(audio_path)
+    segments, info = model.transcribe(audio_array, language="zh", vad_filter=True, beam_size=beam_size)
     results = []
     for seg in segments:
         results.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
@@ -367,17 +468,33 @@ def compute_free_box(width: int, height: int, x_pct: float, y_pct: float, w_pct:
     return x, y, w, h
 
 
+def compute_logo_box(width: int, height: int, corner: str):
+    bw, bh = int(width * 0.22), int(height * 0.13)
+    cx = 0 if corner[1] == "l" else width - bw
+    cy = 0 if corner[0] == "t" else height - bh
+    return cx, cy, bw, bh
+
+
 def process_video(video_path: str, output_path: str, *,
                    remove_old_sub: bool = False, old_sub_method: str = "blur",
                    old_sub_box=None, old_sub_color: str = "0x000000", blur_strength: int = 25,
                    burn_new_sub: bool = False, srt_path: str = None,
                    font_size: int = 20, primary_color: str = "&H00FFFFFF&",
                    outline_color: str = "&H00000000&", alignment: int = 2, margin_v: int = 25,
-                   video_preset: str = "veryfast"):
-    """Gộp bước xóa phụ đề gốc + ghi phụ đề mới vào MỘT lần encode video duy nhất."""
+                   video_preset: str = "veryfast", hflip: bool = False, frame_width: int = None):
+    """Gộp lật gương + xóa phụ đề gốc + ghi phụ đề mới vào MỘT lần encode video duy nhất."""
     filters = []
     stage = "[0:v]"
     counter = 0
+
+    if hflip:
+        # Lật gương trước; toạ độ vùng che phụ đề gốc được lật theo để vẫn trùng đúng chỗ,
+        # còn phụ đề mới ghi SAU bước này nên không bị ngược chữ.
+        filters.append(f"{stage}hflip[vflip{counter}]")
+        stage = f"[vflip{counter}]"
+        if old_sub_box and frame_width:
+            bx, by, bw, bh = old_sub_box
+            old_sub_box = (frame_width - bx - bw, by, bw, bh)
 
     if remove_old_sub and old_sub_box:
         x, y, w, h = old_sub_box
@@ -423,7 +540,7 @@ def process_video(video_path: str, output_path: str, *,
         "-c:a", "copy",
         output_path,
     ]
-    _run_ffmpeg(cmd, label="xử lý hình ảnh video (xoá phụ đề gốc / ghi phụ đề mới)")
+    _run_ffmpeg(cmd, label="xử lý hình ảnh video (lật gương / xoá phụ đề gốc / ghi phụ đề mới)")
 
 
 def adjust_video_volume(video_path: str, output_path: str, volume_factor: float):
@@ -434,6 +551,276 @@ def adjust_video_volume(video_path: str, output_path: str, volume_factor: float)
         output_path,
     ]
     _run_ffmpeg(cmd, label="điều chỉnh âm lượng gốc")
+
+
+# ============================================================
+# VIRAL BOOST — lượt xử lý hoàn thiện cuối (1 lần encode)
+# ============================================================
+
+def _ff_escape_path(p: str) -> str:
+    return p.replace("\\", "/").replace(":", "\\:")
+
+
+def finish_video(in_path: str, out_path: str, tmp_dir: str, *, speed: float = 1.0, zoom_pct: int = 0,
+                  color_boost: bool = False, logo_corner=None, vertical: bool = False,
+                  hook_text: str = "", watermark_text: str = "", progress_bar: bool = False,
+                  fade: bool = False, loudnorm: bool = False, video_preset: str = "veryfast"):
+    """Áp các hiệu ứng Viral Boost lên video cuối cùng trong MỘT lần encode.
+    Trả về danh sách ghi chú (vd: thiếu font nên bỏ qua chữ chèn)."""
+    notes = []
+    res = get_video_resolution(in_path)
+    if res is None:
+        raise FFmpegError("Không đọc được độ phân giải video để áp hiệu ứng Viral Boost.")
+    W, H = res
+    D_in = ffprobe_duration(in_path)
+    D = D_in / speed
+    font = find_font_path()
+    audio_ok = has_audio_stream(in_path)
+
+    chain, extra_inputs = [], []
+    state = {"stage": "[0:v]", "n": 0}
+
+    def nxt():
+        state["n"] += 1
+        return state["n"]
+
+    def add(flt):
+        k = nxt()
+        label = f"[f{k}]"
+        chain.append(f"{state['stage']}{flt}{label}")
+        state["stage"] = label
+
+    # 1) Che logo/watermark gốc ở góc
+    if logo_corner:
+        cx, cy, bw, bh = compute_logo_box(W, H, logo_corner)
+        k = nxt()
+        src = state["stage"]
+        chain.append(f"{src}split=2[la{k}][lb{k}]")
+        chain.append(
+            f"[lb{k}]crop={bw}:{bh}:{cx}:{cy},"
+            f"boxblur=luma_radius=20:luma_power=2:chroma_radius=10:chroma_power=2[lc{k}]"
+        )
+        chain.append(f"[la{k}][lc{k}]overlay={cx}:{cy}[f{k}]")
+        state["stage"] = f"[f{k}]"
+
+    # 2) Zoom nhẹ (cắt giữa rồi phóng lại về đúng kích thước)
+    if zoom_pct > 0:
+        z = 1 + zoom_pct / 100
+        add(f"crop=trunc(iw/{z:.4f}/2)*2:trunc(ih/{z:.4f}/2)*2,scale={W}:{H}")
+
+    # 3) Tăng màu & độ nét
+    if color_boost:
+        add("eq=contrast=1.06:saturation=1.18:brightness=0.02,unsharp=5:5:0.7:5:5:0.0")
+
+    # 4) Tăng tốc nhẹ
+    if abs(speed - 1.0) > 0.001:
+        add(f"setpts=PTS/{speed:.4f}")
+
+    OW, OH = W, H
+    # 5) Khung dọc 9:16 (Shorts/Reels/TikTok) với nền mờ
+    if vertical:
+        k = nxt()
+        src = state["stage"]
+        chain.append(f"{src}split=2[bs{k}][fs{k}]")
+        chain.append(
+            f"[bs{k}]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+            f"boxblur=luma_radius=25:luma_power=2:chroma_radius=12:chroma_power=2[bg{k}]"
+        )
+        chain.append(f"[fs{k}]scale=1080:-2[fg{k}]")
+        chain.append(f"[bg{k}][fg{k}]overlay=(W-w)/2:(H-h)/2[f{k}]")
+        state["stage"] = f"[f{k}]"
+        OW, OH = 1080, 1920
+
+    # 6) Chữ hook 3-4 giây đầu + watermark tên kênh
+    if (hook_text.strip() or watermark_text.strip()) and not font:
+        notes.append("Không tìm thấy font trên máy nên bỏ qua chữ hook/watermark "
+                     "(cài font DejaVu: sudo apt install fonts-dejavu-core).")
+    elif font:
+        ff = _ff_escape_path(font)
+        if hook_text.strip():
+            wrapped = "\n".join(textwrap.wrap(hook_text.strip(), width=18 if vertical else 28))
+            hp = os.path.join(tmp_dir, "hook.txt")
+            with open(hp, "w", encoding="utf-8") as f:
+                f.write(wrapped)
+            fs = max(int(OH / (22 if vertical else 18)), 18)
+            add(
+                f"drawtext=fontfile='{ff}':textfile='{_ff_escape_path(hp)}':expansion=none:"
+                f"fontcolor=0xFFE600:fontsize={fs}:borderw={max(fs // 12, 2)}:bordercolor=black:"
+                f"line_spacing=8:x=(w-text_w)/2:y=h*0.10:enable='between(t,0,{min(4.0, D):.1f})'"
+            )
+        if watermark_text.strip():
+            wp = os.path.join(tmp_dir, "watermark.txt")
+            with open(wp, "w", encoding="utf-8") as f:
+                f.write(watermark_text.strip())
+            fs2 = max(int(OH / 40), 14)
+            pad = max(int(OW * 0.03), 10)
+            add(
+                f"drawtext=fontfile='{ff}':textfile='{_ff_escape_path(wp)}':expansion=none:"
+                f"fontcolor=white@0.7:fontsize={fs2}:borderw=2:bordercolor=black@0.6:x=w-text_w-{pad}:y={pad}"
+            )
+
+    # 7) Thanh tiến trình chạy dưới đáy
+    if progress_bar:
+        bar_h = max(int(OH / 150), 4)
+        extra_inputs += ["-f", "lavfi", "-i", f"color=c=0xFF3B30:s={OW}x{bar_h}:r=30:d={D + 1:.2f}"]
+        k = nxt()
+        chain.append(f"{state['stage']}[1:v]overlay=x='-w+w*t/{D:.3f}':y=H-h:shortest=1[f{k}]")
+        state["stage"] = f"[f{k}]"
+
+    # 8) Fade vào/ra
+    if fade and D > 2:
+        add(f"fade=t=in:st=0:d=0.6,fade=t=out:st={D - 0.6:.3f}:d=0.6")
+
+    # Âm thanh: tăng tốc, chuẩn hoá âm lượng, fade
+    a_parts = []
+    if audio_ok:
+        if abs(speed - 1.0) > 0.001:
+            a_parts.append(f"atempo={speed:.4f}")
+        if loudnorm:
+            a_parts.append("loudnorm=I=-14:TP=-1.5:LRA=11")
+        if fade and D > 2:
+            a_parts.append(f"afade=t=in:st=0:d=0.6,afade=t=out:st={D - 0.6:.3f}:d=0.6")
+        if a_parts:
+            chain.append(f"[0:a]{','.join(a_parts)}[aout]")
+
+    vid_filtered = state["stage"] != "[0:v]"
+    cmd = ["ffmpeg", "-y", "-i", in_path] + extra_inputs
+    if chain:
+        cmd += ["-filter_complex", ";".join(chain)]
+    cmd += ["-map", state["stage"] if vid_filtered else "0:v"]
+    if audio_ok:
+        cmd += ["-map", "[aout]" if a_parts else "0:a?"]
+    if vid_filtered:
+        cmd += ["-c:v", "libx264", "-preset", video_preset, "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0"]
+    else:
+        cmd += ["-c:v", "copy"]
+    if audio_ok:
+        cmd += ["-c:a", "aac", "-b:a", "192k"] if a_parts else ["-c:a", "copy"]
+    cmd += ["-movflags", "+faststart", out_path]
+    _run_ffmpeg(cmd, label="Viral Boost (hiệu ứng hoàn thiện video)")
+    return notes
+
+
+# ============================================================
+# THUMBNAIL + GÓI YOUTUBE
+# ============================================================
+
+def make_thumbnail(video_path: str, title: str, out_path: str, vertical: bool = False):
+    """Tạo thumbnail bắt mắt: khung hình đẹp + tăng màu + chữ vàng viền đen. Trả về True nếu thành công."""
+    try:
+        dur = ffprobe_duration(video_path)
+    except Exception:
+        dur = 0
+    frame_path = out_path + ".frame.jpg"
+    ok = False
+    for ts in (dur * 0.25, dur * 0.5, 0):
+        ok, _ = _try_grab_frame(
+            ["ffmpeg", "-y", "-ss", f"{max(ts, 0):.2f}", "-i", video_path, "-frames:v", "1", "-q:v", "2", frame_path],
+            frame_path,
+        )
+        if ok:
+            break
+    if not ok:
+        return False
+
+    target = (1080, 1920) if vertical else (1280, 720)
+    img = Image.open(frame_path).convert("RGB")
+    img = ImageOps.fit(img, target, Image.LANCZOS)
+    img = ImageEnhance.Color(img).enhance(1.25)
+    img = ImageEnhance.Contrast(img).enhance(1.08)
+
+    w, h = img.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    for y in range(h):
+        alpha = int(190 * max(0.0, (y / h - 0.40) / 0.60))
+        if alpha:
+            od.line([(0, y), (w, y)], fill=(0, 0, 0, alpha))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+    text = " ".join(title.upper().split())
+    if text:
+        size = int(min(w, h) / (7 if not vertical else 9))
+        font = _load_preview_font(size)
+        lines = textwrap.wrap(text, width=16 if not vertical else 12)[:3]
+        draw = ImageDraw.Draw(img)
+        line_h = int(size * 1.18)
+        y = h - int(h * 0.06) - line_h * len(lines)
+        x = int(w * 0.05)
+        for line in lines:
+            draw.text((x, y), line, font=font, fill="#FFE600", stroke_width=max(size // 8, 4), stroke_fill="black")
+            y += line_h
+
+    img.save(out_path, "JPEG", quality=92)
+    try:
+        os.remove(frame_path)
+    except OSError:
+        pass
+    return True
+
+
+def _fmt_clock(sec: float) -> str:
+    sec = int(max(sec, 0))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _shorten(text: str, n: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def build_youtube_pack(segments, total_duration: float, speed: float = 1.0, channel_name: str = "",
+                        vertical: bool = False, custom_title: str = "") -> str:
+    """Gợi ý tiêu đề, mô tả, mốc chương và hashtag dựa trên nội dung đã dịch (không cần gọi API)."""
+    first = _shorten(segments[0]["translated"], 55) if segments else "Video hay"
+    base = custom_title.strip() or first
+    titles = [
+        f"[Vietsub] {base}",
+        f"😱 {base} — Xem đến cuối!",
+        f"Không thể tin nổi! {base}",
+        f"{base} | Lồng tiếng Việt",
+        f"🔥 {base} (Cực hot)",
+    ]
+    titles = [_shorten(t, 100) for t in titles]
+
+    summary = _shorten(" ".join(s["translated"].strip() for s in segments[:3]), 240)
+
+    out_dur = total_duration / speed
+    chapters = [("00:00", "Mở đầu")]
+    last = 0.0
+    gap = max(15.0, out_dur / 8)
+    for seg in segments:
+        t = seg["start"] / speed
+        if t - last >= gap and len(chapters) < 8:
+            chapters.append((_fmt_clock(t), _shorten(seg["translated"], 45)))
+            last = t
+    if len(chapters) < 3:
+        chapters = []
+
+    tags = ["#vietsub", "#longtieng", "#viral", "#xuhuong"]
+    if vertical:
+        tags.append("#shorts")
+    chan_tag = re.sub(r"\W", "", channel_name or "")
+    if chan_tag:
+        tags.append("#" + chan_tag)
+
+    lines = ["=== GỢI Ý TIÊU ĐỀ (chọn 1, nhớ chỉnh cho đúng nội dung) ==="]
+    lines += [f"{i}. {t}" for i, t in enumerate(titles, 1)]
+    lines += ["", "=== MÔ TẢ ===", f"🎬 {base}", summary, ""]
+    if chapters:
+        lines.append("📌 Mốc thời gian:")
+        lines += [f"{t} {label}" for t, label in chapters]
+        lines.append("")
+    chan_text = f" {channel_name}" if channel_name else ""
+    lines += [
+        f"👍 Thấy hay thì like, chia sẻ và đăng ký kênh{chan_text} để xem thêm video mới mỗi ngày!",
+        "🌐 Video được dịch & lồng tiếng sang tiếng Việt.",
+        "🔗 Nguồn video gốc: (điền tên tác giả / link gốc tại đây)",
+        "",
+        " ".join(tags),
+    ]
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -692,16 +1079,12 @@ def ensure_detected_box(video_path: str, width: int, height: int):
 
 
 def _load_preview_font(size: int):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            try:
-                return ImageFont.truetype(c, size)
-            except Exception:
-                pass
+    p = find_font_path()
+    if p:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
     return ImageFont.load_default()
 
 
@@ -753,6 +1136,37 @@ def render_old_sub_box_preview(base_image: "Image.Image", box, method: str,
 
     draw = ImageDraw.Draw(img)
     draw.rectangle([x, y, x2 - 1, y2 - 1], outline="#FF3B30", width=max(int(h * 0.06), 2))
+    return img
+
+
+def render_zoom_preview(img: "Image.Image", zoom_pct: int) -> "Image.Image":
+    z = 1 + zoom_pct / 100
+    w, h = img.size
+    cw, ch = int(w / z), int(h / z)
+    left, top = (w - cw) // 2, (h - ch) // 2
+    return img.crop((left, top, left + cw, top + ch)).resize((w, h), Image.LANCZOS)
+
+
+def render_text_overlays_preview(img: "Image.Image", hook_text: str, watermark_text: str) -> "Image.Image":
+    img = img.copy()
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    if hook_text.strip():
+        fs = max(int(h / 18), 14)
+        font = _load_preview_font(fs)
+        y = int(h * 0.10)
+        for line in textwrap.wrap(hook_text.strip(), width=28):
+            bb = draw.textbbox((0, 0), line, font=font)
+            draw.text(((w - (bb[2] - bb[0])) / 2, y), line, font=font, fill="#FFE600",
+                      stroke_width=max(fs // 12, 2), stroke_fill="black")
+            y += int(fs * 1.25)
+    if watermark_text.strip():
+        fs2 = max(int(h / 40), 12)
+        font2 = _load_preview_font(fs2)
+        bb = draw.textbbox((0, 0), watermark_text.strip(), font=font2)
+        pad = max(int(w * 0.03), 8)
+        draw.text((w - (bb[2] - bb[0]) - pad, pad), watermark_text.strip(), font=font2, fill="#E8E8E8",
+                  stroke_width=1, stroke_fill="black")
     return img
 
 
@@ -1007,6 +1421,57 @@ with st.container(key="card_style"):
 
 outline_color = auto_outline_color(text_color)
 
+# ---------- BƯỚC 3: VIRAL BOOST ----------
+with st.container(key="card_viral"):
+    step_header(3, "🚀 Viral Boost", "Tăng sức hút cho video — bật cái nào dùng cái đó, tất cả đều không bắt buộc")
+
+    tab_img, tab_txt, tab_aud, tab_pub = st.tabs(["🎞️ Hình ảnh", "🪝 Chữ & nhận diện", "🔊 Nhịp & âm thanh", "📦 Xuất bản"])
+
+    with tab_img:
+        v_hflip = st.toggle("🪞 Lật gương video", value=False,
+                            help="Lật ngang toàn bộ hình. Phụ đề mới vẫn đọc đúng chiều.")
+        v_zoom = st.slider("🔍 Zoom nhẹ vào giữa (%)", 0, 10, 0, step=1,
+                           help="Phóng to nhẹ để khung hình gọn hơn và loại bỏ viền thừa. 0 = tắt.")
+        v_color = st.toggle("🎨 Tăng màu & độ nét", value=False,
+                            help="Tăng nhẹ tương phản, độ bão hoà và độ nét để hình bắt mắt hơn.")
+        v_vertical = st.toggle("📱 Khung dọc 9:16 (Shorts / Reels / TikTok)", value=False,
+                               help="Xuất 1080×1920, video nằm giữa, nền là chính video đó làm mờ. Không hiện trong ảnh xem trước.")
+        v_logo_label = st.segmented_control(
+            "🙈 Che logo / watermark gốc ở góc", list(LOGO_CORNERS.keys()), default="Không che",
+            selection_mode="single",
+        ) or "Không che"
+        v_logo = LOGO_CORNERS[v_logo_label]
+
+    with tab_txt:
+        v_hook = st.text_input("🪝 Chữ hook 3–4 giây đầu", value="", max_chars=80,
+                               placeholder="VD: Không ai ngờ chuyện này xảy ra...",
+                               help="Dòng chữ vàng to hiện ở đầu video để giữ chân người xem.")
+        v_watermark = st.text_input("🏷️ Watermark tên kênh (góc trên phải)", value="", max_chars=40,
+                                    placeholder="VD: @TenKenhCuaBan")
+        v_progress = st.toggle("📊 Thanh tiến trình chạy dưới đáy video", value=False,
+                               help="Thanh đỏ chạy dần giúp người xem muốn xem đến hết video.")
+
+    with tab_aud:
+        v_speed = st.slider("⏩ Tăng tốc nhẹ", 1.00, 1.15, 1.00, step=0.01, format="%.2fx",
+                            help="Tăng tốc cả hình và tiếng. 1.05x gần như không nhận ra nhưng giúp video gọn, nhịp nhanh hơn.")
+        v_fade = st.toggle("🌅 Fade vào / ra đầu cuối video", value=False)
+        v_loud = st.toggle("🔊 Chuẩn hoá âm lượng (-14 LUFS chuẩn YouTube)", value=True,
+                           help="Đưa âm lượng về mức chuẩn để không quá nhỏ hoặc quá to so với video khác.")
+
+    with tab_pub:
+        v_channel = st.text_input("📺 Tên kênh (dùng trong mô tả & hashtag)", value="", max_chars=40)
+        v_thumb = st.toggle("🖼️ Tạo thumbnail tự động", value=True,
+                            help="Lấy khung hình đẹp, tăng màu, thêm chữ vàng viền đen.")
+        v_thumb_title = st.text_input("Chữ trên thumbnail", value="", max_chars=60,
+                                      placeholder="Để trống = dùng chữ hook, hoặc câu đầu tiên của video",
+                                      disabled=not v_thumb)
+        v_pack = st.toggle("📝 Tạo gói YouTube (tiêu đề, mô tả, mốc thời gian, hashtag)", value=True,
+                           help="Gợi ý dựa trên nội dung đã dịch. Nhớ chỉnh lại cho đúng ý trước khi đăng.")
+
+    st.html('<div class="note">⚠️ Chỉ đăng lại video bạn có quyền sử dụng hoặc đã được tác giả đồng ý, và nên ghi nguồn. '
+            'YouTube ưu tiên nội dung có đóng góp mới (dịch, lồng tiếng, bình luận) — các hiệu ứng ở đây không đảm bảo '
+            'video qua được kiểm tra bản quyền.</div>')
+
 # ---------- TUỲ CHỈNH NÂNG CAO ----------
 with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
     st.caption("Chỉ mở phần này nếu bạn muốn tự tay ghi đè các lựa chọn tự động.")
@@ -1096,9 +1561,9 @@ if remove_old_sub and pw and ph:
     elif detected_box:
         old_sub_box = detected_box
 
-# ---------- BƯỚC 3: XEM TRƯỚC ----------
+# ---------- BƯỚC 4: XEM TRƯỚC ----------
 with st.container(key="card_preview"):
-    step_header(3, "Xem trước", "Mô phỏng nhanh trên 1 khung hình của video")
+    step_header(4, "Xem trước", "Mô phỏng nhanh trên 1 khung hình của video")
 
     if active_video_path is None:
         st.caption("Tải video lên ở bước 1 để xem bản xem trước.")
@@ -1110,20 +1575,36 @@ with st.container(key="card_preview"):
                 st.code(preview_err)
     else:
         combined_img = Image.open(preview_frame_path).convert("RGB")
-        if remove_old_sub and old_sub_box is not None:
-            combined_img = render_old_sub_box_preview(combined_img, old_sub_box, old_sub_method_key, box_color, blur_strength)
+        preview_box = old_sub_box
+        if v_hflip:
+            combined_img = ImageOps.mirror(combined_img)
+            if preview_box:
+                bx, by, bw, bh = preview_box
+                preview_box = (combined_img.width - bx - bw, by, bw, bh)
+        if remove_old_sub and preview_box is not None:
+            combined_img = render_old_sub_box_preview(combined_img, preview_box, old_sub_method_key, box_color, blur_strength)
         if burn_sub:
             combined_img = render_subtitle_style_preview(
                 combined_img, SAMPLE_SUBTITLE_TEXT, font_size, text_color, outline_color,
                 POSITION_OPTIONS[position_label], margin_v,
             )
+        if v_zoom > 0:
+            combined_img = render_zoom_preview(combined_img, v_zoom)
+        if v_logo:
+            combined_img = render_old_sub_box_preview(
+                combined_img, compute_logo_box(combined_img.width, combined_img.height, v_logo), "blur", "#000000", 25
+            )
+        if v_hook.strip() or v_watermark.strip():
+            combined_img = render_text_overlays_preview(combined_img, v_hook, v_watermark)
         st.image(combined_img, width="stretch")
 
         legend = []
         if remove_old_sub:
-            legend.append("🟥 Khung đỏ = vùng phụ đề gốc (tự phát hiện) sẽ bị che")
+            legend.append("🟥 Khung đỏ = vùng bị che (phụ đề gốc / logo góc)")
         if burn_sub:
             legend.append("🔤 Chữ mẫu = kiểu phụ đề mới")
+        if v_hook.strip():
+            legend.append("🪝 Chữ vàng = hook đầu video")
         if legend:
             st.html('<div class="legend">' + "".join(f"<span>{t}</span>" for t in legend) + "</div>")
         st.caption("Hình mô phỏng gần đúng, kết quả thật có thể chênh lệch nhẹ."
@@ -1139,14 +1620,16 @@ with st.container(key="card_preview"):
                 f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz",
             )
 
-# ---------- BƯỚC 4: XỬ LÝ ----------
+# ---------- BƯỚC 5: XỬ LÝ ----------
 with st.container(key="card_run"):
-    step_header(4, "Bắt đầu xử lý", "Nhận diện → Dịch → Che phụ đề gốc → Ghi phụ đề mới → Lồng tiếng")
+    step_header(5, "Bắt đầu xử lý", "Nhận diện → Dịch → Che phụ đề gốc → Ghi phụ đề mới → Lồng tiếng → Viral Boost")
     start_button = st.button("🚀 Bắt đầu xử lý", type="primary", width="stretch", disabled=active_video_path is None)
 
 if start_button:
-    if not burn_sub and not enable_dub and not remove_old_sub:
-        st.warning("Bạn cần bật ít nhất một trong: ghi phụ đề chữ, xoá phụ đề gốc, hoặc lồng tiếng AI (xem Tuỳ chỉnh nâng cao).")
+    need_finish = any([v_zoom > 0, v_color, v_logo, v_vertical, v_hook.strip(), v_watermark.strip(),
+                       v_progress, v_fade, v_loud, abs(v_speed - 1.0) > 0.001])
+    if not burn_sub and not enable_dub and not remove_old_sub and not v_hflip and not need_finish:
+        st.warning("Bạn cần bật ít nhất một chức năng: ghi phụ đề chữ, xoá phụ đề gốc, lồng tiếng AI hoặc một hiệu ứng Viral Boost.")
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1158,6 +1641,10 @@ if start_button:
         srt_path = os.path.join(tmp_dir, "output.srt")
 
         status = st.status("Đang xử lý...", expanded=True)
+        finish_notes = []
+        thumb_bytes = None
+        pack_text = None
+        dub_warning_count = 0
 
         try:
             with status:
@@ -1190,18 +1677,16 @@ if start_button:
                 original_volume_factor = original_volume_pct / 100.0
                 current_video = input_path
 
-                if remove_old_sub or burn_sub:
-                    st.write("🎞️ Đang xử lý hình ảnh video (xoá phụ đề gốc / ghi phụ đề mới)...")
+                if remove_old_sub or burn_sub or v_hflip:
+                    st.write("🎞️ Đang xử lý hình ảnh video (lật gương / xoá phụ đề gốc / ghi phụ đề mới)...")
+                    resolution = get_video_resolution(current_video) or st.session_state.get("preview_video_res")
                     final_old_sub_box = None
+                    if (remove_old_sub or v_hflip) and resolution is None:
+                        raise FFmpegError(
+                            "Không xác định được độ phân giải video để xử lý hình ảnh — "
+                            "file có thể bị lỗi hoặc dùng codec không được hỗ trợ."
+                        )
                     if remove_old_sub:
-                        resolution = get_video_resolution(current_video)
-                        if resolution is None:
-                            resolution = st.session_state.get("preview_video_res")
-                        if resolution is None:
-                            raise FFmpegError(
-                                "Không xác định được độ phân giải video để xoá phụ đề gốc — "
-                                "file có thể bị lỗi hoặc dùng codec không được hỗ trợ."
-                            )
                         width, height = resolution
                         if adv_manual_old_box and manual_box_pct:
                             final_old_sub_box = compute_free_box(width, height, *manual_box_pct)
@@ -1229,10 +1714,10 @@ if start_button:
                         alignment=POSITION_OPTIONS[position_label],
                         margin_v=margin_v,
                         video_preset=speed_cfg["video_preset"],
+                        hflip=v_hflip, frame_width=resolution[0] if resolution else None,
                     )
                     current_video = processed_output
 
-                dub_warning_count = 0
                 if enable_dub:
                     st.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
                     tts_bar = st.progress(0, text="Đang tạo giọng đọc...")
@@ -1258,12 +1743,43 @@ if start_button:
                     adjust_video_volume(current_video, vol_output, original_volume_factor)
                     current_video = vol_output
 
+                if need_finish:
+                    st.write("🚀 Đang áp dụng Viral Boost (zoom, màu, chữ hook, tốc độ, 9:16, âm lượng...)...")
+                    final_output = os.path.join(tmp_dir, "final.mp4")
+                    finish_notes = finish_video(
+                        current_video, final_output, tmp_dir,
+                        speed=v_speed, zoom_pct=v_zoom, color_boost=v_color, logo_corner=v_logo,
+                        vertical=v_vertical, hook_text=v_hook, watermark_text=v_watermark,
+                        progress_bar=v_progress, fade=v_fade, loudnorm=v_loud,
+                        video_preset=speed_cfg["video_preset"],
+                    )
+                    current_video = final_output
+
+                if v_thumb:
+                    st.write("🖼️ Đang tạo thumbnail...")
+                    thumb_path = os.path.join(tmp_dir, "thumbnail.jpg")
+                    thumb_title = (v_thumb_title.strip() or v_hook.strip()
+                                   or _shorten(segments[0]["translated"], 40))
+                    if make_thumbnail(current_video, thumb_title, thumb_path, vertical=v_vertical):
+                        with open(thumb_path, "rb") as f:
+                            thumb_bytes = f.read()
+                    else:
+                        finish_notes.append("Không tạo được thumbnail từ video này.")
+
+                if v_pack:
+                    st.write("📝 Đang soạn gói YouTube (tiêu đề, mô tả, hashtag)...")
+                    pack_text = build_youtube_pack(
+                        segments, total_duration, speed=v_speed, channel_name=v_channel,
+                        vertical=v_vertical, custom_title=v_hook,
+                    )
+
             status.update(label="Hoàn tất!", state="complete", expanded=False)
         except FFmpegError as e:
             status.update(label="Xử lý thất bại ❌", state="error")
             st.error(f"❌ {e}")
-            st.info("💡 Lỗi thường gặp: video có codec lạ, không có audio, hoặc vùng che phụ đề tràn khung hình. "
-                     "Thử video khác hoặc mở '⚙️ Tuỳ chỉnh nâng cao' để tự chỉnh vùng che / tắt bớt bước xử lý.")
+            st.info("💡 Lỗi thường gặp: video có codec lạ, không có audio, vùng che phụ đề tràn khung hình, hoặc ffmpeg thiếu "
+                     "bộ lọc (vd drawtext). Thử video khác, tắt bớt hiệu ứng Viral Boost hoặc mở '⚙️ Tuỳ chỉnh nâng cao' "
+                     "để chỉnh vùng che.")
             st.stop()
         except Exception as e:
             status.update(label="Xử lý thất bại ❌", state="error")
@@ -1275,6 +1791,8 @@ if start_button:
                 f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
                 "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
             )
+        for note in finish_notes:
+            st.warning(f"⚠️ {note}")
 
         with open(current_video, "rb") as f:
             video_bytes = f.read()
@@ -1282,30 +1800,49 @@ if start_button:
         st.toast("Xử lý xong!", icon="✅")
 
         with st.container(key="card_result"):
-            step_header(5, "Kết quả cuối cùng", "Xem lại, tải video và file phụ đề")
+            step_header(6, "Kết quả cuối cùng", "Xem lại, tải video, phụ đề, thumbnail và gói YouTube")
 
             r1, r2, r3 = st.columns(3)
             r1.metric("Số câu", len(segments))
-            r2.metric("Thời lượng", f"{total_duration:.0f}s")
+            r2.metric("Thời lượng", f"{total_duration / v_speed:.0f}s")
             r3.metric("Câu lỗi TTS", dub_warning_count)
 
-            tab_video, tab_sub = st.tabs(["🎬 Video", "📜 Nội dung phụ đề"])
-            with tab_video:
+            tab_names = ["🎬 Video", "📜 Phụ đề"]
+            if thumb_bytes:
+                tab_names.append("🖼️ Thumbnail")
+            if pack_text:
+                tab_names.append("📦 Gói YouTube")
+            tabs = st.tabs(tab_names)
+
+            with tabs[0]:
                 st.video(video_bytes)
-            with tab_sub:
+            with tabs[1]:
                 for seg in segments:
                     st.markdown(f"**[{seg['start']:.1f}s – {seg['end']:.1f}s]**")
                     if bilingual:
                         st.write(f"🇨🇳 {seg['text']}")
                     st.write(f"🇻🇳 {seg['translated']}")
                     st.divider()
+            tab_idx = 2
+            if thumb_bytes:
+                with tabs[tab_idx]:
+                    st.image(thumb_bytes, width="stretch")
+                    st.download_button("⬇️ Tải thumbnail (.jpg)", data=thumb_bytes, file_name="thumbnail.jpg",
+                                        mime="image/jpeg", width="stretch", on_click="ignore")
+                tab_idx += 1
+            if pack_text:
+                with tabs[tab_idx]:
+                    st.caption("Bấm biểu tượng sao chép ở góc phải khung bên dưới. Nhớ chỉnh lại cho đúng nội dung video.")
+                    st.code(pack_text, language=None)
+                    st.download_button("⬇️ Tải gói YouTube (.txt)", data=pack_text, file_name="goi_youtube.txt",
+                                        mime="text/plain", width="stretch", on_click="ignore")
 
             colA, colB = st.columns(2)
             with colA:
                 st.download_button("⬇️ Tải video kết quả", data=video_bytes, file_name="video_ket_qua.mp4",
-                                    mime="video/mp4", type="primary", width="stretch")
+                                    mime="video/mp4", type="primary", width="stretch", on_click="ignore")
             with colB:
                 st.download_button("⬇️ Tải file phụ đề (.srt)", data=srt_content, file_name="phu_de.srt",
-                                    mime="text/plain", width="stretch")
+                                    mime="text/plain", width="stretch", on_click="ignore")
 
 st.html('<div class="footer">Made with Streamlit · Whisper · edge-tts · ffmpeg</div>')
