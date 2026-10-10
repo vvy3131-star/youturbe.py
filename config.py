@@ -82,3 +82,22 @@ for folder in [
     OUTPUT_FOLDER
 ]:
     os.makedirs(folder, exist_ok=True)
+[server]
+maxUploadSize = 2048
+maxMessageSize = 2048
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#8b5cf6"
+backgroundColor = "#0b1020"
+secondaryBackgroundColor = "#141a33"
+textColor = "#e8ecf8"
+borderColor = "#2a3358"
+font = "sans serif"
+baseRadius = "large"
