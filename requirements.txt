@@ -12,3 +12,9 @@ pysubs2
 opencv-python-headless
 Pillow
 numpy
+streamlit>=1.50.0
+faster-whisper
+deep-translator
+edge-tts
+Pillow
+numpy
