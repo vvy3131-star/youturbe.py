@@ -13,8 +13,8 @@ opencv-python-headless
 Pillow
 numpy
 streamlit>=1.50.0
-faster-whisper
-av>=12.0.0
+faster-whisper==1.0.3
+av<16.0.0
 deep-translator
 edge-tts
 Pillow
