@@ -6,6 +6,10 @@ Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI
 màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
 
 BẢN NÀY CÓ GÌ MỚI
+    - TỐI ƯU CHO STREAMLIT: kết quả được lưu trong phiên (đổi widget / bấm tải xuống không làm mất),
+      tự nhận biết Streamlit Cloud để chọn cấu hình nhẹ, giải phóng RAM model Whisper sau khi nhận diện,
+      giới hạn model cache (max_entries=1), dọn thư mục tạm cũ, băm file upload nhanh, không nhân đôi file
+      video trên đĩa, VieNeu có 3 chế độ (Turbo / Turbo int8 / Nano siêu nhẹ).
     - THÊM GIỌNG AI VieNeu-TTS (github.com/pnnbao97/VieNeu-TTS): giọng Việt tự nhiên, chạy offline
       trên CPU (ONNX), nằm chung danh sách giọng với edge-tts. Có nút quét toàn bộ giọng có sẵn.
       Nếu VieNeu chưa cài / lỗi → tự chuyển sang edge-tts rồi gTTS nên video không bao giờ hỏng.
@@ -35,10 +39,34 @@ CẤU TRÚC THƯ MỤC:
     app.py
     requirements.txt            (thêm dòng: vieneu)
     packages.txt                (Streamlit Cloud: ffmpeg, fonts-dejavu-core)
-    .streamlit/config.toml      (theme tối + nâng giới hạn upload lên 2GB)
+    .streamlit/config.toml      (theme tối + nâng giới hạn upload)
+
+TRIỂN KHAI TRÊN STREAMLIT COMMUNITY CLOUD (RAM ~1GB, 2 CPU):
+    requirements.txt:
+        streamlit>=1.50
+        faster-whisper
+        numpy
+        Pillow
+        edge-tts
+        gTTS
+        deep-translator
+        vieneu                 # bỏ dòng này nếu không dùng giọng VieNeu
+    packages.txt:
+        ffmpeg
+        fonts-dejavu-core
+    .streamlit/config.toml:
+        [server]
+        maxUploadSize = 300
+        fileWatcherType = "none"
+        [browser]
+        gatherUsageStats = false
+        [theme]
+        base = "dark"
+    Gợi ý: video ngắn (< 10 phút), model Whisper "base"/"small", VieNeu chế độ Nano.
 """
 
 import asyncio
+import gc
 import hashlib
 import html as html_lib
 import json
@@ -263,15 +291,50 @@ VOICE_STYLE_OPTIONS = {
 # ---------- GIỌNG VieNeu-TTS (github.com/pnnbao97/VieNeu-TTS) ----------
 # Danh sách mặc định (đã có sẵn trong gói vieneu). Bấm nút "Quét giọng VieNeu" trong phần
 # Tuỳ chỉnh nâng cao để lấy toàn bộ giọng có thật trong bản vieneu đang cài trên máy.
-VIENEU_STATIC_VOICES = [("Hải Đăng", "Hải Đăng"), ("Minh Quân", "Minh Quân")]
+# Nhận biết đang chạy trên Streamlit Community Cloud (RAM/CPU hạn chế) để chọn cấu hình mặc định nhẹ hơn.
+IS_CLOUD = os.path.exists("/mount/src") or bool(os.environ.get("STREAMLIT_SHARING_MODE"))
 EDGE_FALLBACK_VOICE = "vi-VN-HoaiMyNeural"   # giọng dự phòng khi VieNeu chưa cài / lỗi
+
+# Các chế độ VieNeu. Nano rất nhẹ (48M tham số, chỉ CPU) nên hợp với Streamlit Cloud; Turbo chất lượng cao hơn nhưng nặng.
+VIENEU_MODES = {
+    "turbo": {
+        "label": "🦜 Turbo — chất lượng cao nhất (48kHz, nặng)",
+        "kwargs": {},
+        "static": [("Hải Đăng", "Hải Đăng")],
+    },
+    "int8": {
+        "label": "⚡ Turbo int8 — nhanh & nhẹ hơn (cần CPU hỗ trợ VNNI)",
+        "kwargs": {"precision": "int8"},
+        "static": [("Hải Đăng", "Hải Đăng")],
+    },
+    "nano": {
+        "label": "🪶 Nano — siêu nhẹ, hợp Streamlit Cloud (24kHz, ít giọng)",
+        "kwargs": {"mode": "v3nano"},
+        "static": [("Minh Quân", "Minh Quân")],
+    },
+}
+DEFAULT_VIENEU_MODE = "nano" if IS_CLOUD else "turbo"
+
+
+def current_vieneu_mode() -> str:
+    label = st.session_state.get("vieneu_mode_label")
+    for key, cfg in VIENEU_MODES.items():
+        if cfg["label"] == label:
+            return key
+    return DEFAULT_VIENEU_MODE
+
+
+def get_vieneu_voices():
+    """Giọng VieNeu của chế độ đang chọn: danh sách đã quét, hoặc danh sách mặc định."""
+    mode = current_vieneu_mode()
+    scanned = (st.session_state.get("vieneu_voices") or {}).get(mode)
+    return scanned or VIENEU_MODES[mode]["static"]
 
 
 def get_voice_options():
-    """Giọng edge-tts + giọng VieNeu-TTS (nếu đã quét thì dùng danh sách quét được)."""
+    """Giọng edge-tts + giọng VieNeu-TTS của chế độ VieNeu đang chọn."""
     options = dict(VOICE_STYLE_OPTIONS)
-    vieneu_voices = st.session_state.get("vieneu_voices") or VIENEU_STATIC_VOICES
-    for label, voice_id in vieneu_voices:
+    for label, voice_id in get_vieneu_voices():
         options[f"🦜 VieNeu - {label}"] = {"engine": "vieneu", "voice": voice_id, "rate": 0, "pitch": 0}
     return options
 
@@ -284,7 +347,7 @@ SPEED_PRESETS = {
     "⚖️ Cân bằng": {"beam_size": 5, "video_preset": "veryfast", "tts_concurrency": 6},
     "🎯 Chính xác nhất": {"beam_size": 8, "video_preset": "medium", "tts_concurrency": 4},
 }
-DEFAULT_SPEED_LABEL = "⚖️ Cân bằng"
+DEFAULT_SPEED_LABEL = "⚡ Nhanh nhất" if IS_CLOUD else "⚖️ Cân bằng"
 DEFAULT_POSITION_LABEL = "Dưới (mặc định)"
 
 LOGO_CORNERS = {
@@ -295,7 +358,11 @@ LOGO_CORNERS = {
     "↘ Dưới phải": "br",
 }
 
-CPU_COUNT = os.cpu_count() or 4
+try:   # os.cpu_count() trên Cloud trả về số nhân của máy chủ chứ không phải phần được cấp → dễ quá tải
+    _AVAILABLE_CPUS = len(os.sched_getaffinity(0))
+except AttributeError:
+    _AVAILABLE_CPUS = os.cpu_count() or 4
+CPU_COUNT = max(1, min(_AVAILABLE_CPUS, 4 if IS_CLOUD else 8))
 
 SAMPLE_SUBTITLE_TEXT = "Đây là câu phụ đề mẫu để xem trước"
 SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe thử trước khi xử lý toàn bộ video."
@@ -408,7 +475,7 @@ def get_video_resolution(path: str):
         return None
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def load_whisper_model(model_size: str):
     from faster_whisper import WhisperModel
     return WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=CPU_COUNT)
@@ -1154,8 +1221,28 @@ def detect_subtitle_region(video_path: str, width: int, height: int, tmp_dir: st
 # XEM TRƯỚC (PREVIEW)
 # ============================================================
 
+@st.cache_resource(show_spinner=False)
+def cleanup_stale_workdirs(max_age_hours: int = 6):
+    """Xoá thư mục tạm cũ của các phiên trước (Streamlit không tự dọn) để khỏi đầy ổ đĩa. Chạy 1 lần mỗi tiến trình."""
+    root = tempfile.gettempdir()
+    now = time.time()
+    try:
+        for name in os.listdir(root):
+            if name.startswith("vidtrans_"):
+                p = os.path.join(root, name)
+                try:
+                    if now - os.path.getmtime(p) > max_age_hours * 3600:
+                        shutil.rmtree(p, ignore_errors=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return True
+
+
 def ensure_workdir() -> str:
-    if "workdir" not in st.session_state:
+    cleanup_stale_workdirs()
+    if "workdir" not in st.session_state or not os.path.isdir(st.session_state.workdir):
         st.session_state.workdir = tempfile.mkdtemp(prefix="vidtrans_")
     return st.session_state.workdir
 
@@ -1167,7 +1254,11 @@ def get_persistent_video_path(uploaded_file) -> str:
     file_key = getattr(uploaded_file, "file_id", None) or f"{uploaded_file.name}-{uploaded_file.size}"
     cache = st.session_state.setdefault("_hash_cache", {})
     if file_key not in cache:
-        cache[file_key] = hashlib.md5(uploaded_file.getbuffer()).hexdigest()[:10]
+        buf = uploaded_file.getbuffer()   # chỉ băm tên + kích thước + 1MB đầu + 1MB cuối (nhanh với file lớn)
+        h = hashlib.md5(f"{uploaded_file.name}|{uploaded_file.size}".encode("utf-8"))
+        h.update(bytes(buf[:1 << 20]))
+        h.update(bytes(buf[-(1 << 20):]))
+        cache[file_key] = h.hexdigest()[:10]
     file_hash = cache[file_key]
 
     ext = os.path.splitext(uploaded_file.name)[1] or ".mp4"
@@ -1276,6 +1367,17 @@ def ensure_detected_box(video_path: str, width: int, height: int):
     return box
 
 
+def ensure_video_duration(video_path: str):
+    """Thời lượng video (giây), chỉ gọi ffprobe 1 lần cho mỗi video trong phiên."""
+    cache = st.session_state.setdefault("_duration_cache", {})
+    if video_path not in cache:
+        try:
+            cache[video_path] = ffprobe_duration(video_path)
+        except Exception:
+            cache[video_path] = None
+    return cache[video_path]
+
+
 def _load_preview_font(size: int):
     p = find_font_path()
     if p:
@@ -1371,7 +1473,7 @@ def render_text_overlays_preview(img: "Image.Image", hook_text: str, watermark_t
 def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, out_path: str,
                                 sample_text: str = SAMPLE_TTS_TEXT, engine: str = "edge"):
     if engine == "vieneu":
-        vieneu_engine = load_vieneu_engine()
+        vieneu_engine = get_vieneu_engine()
         audio = _vieneu_infer(vieneu_engine, sample_text, voice)
         vieneu_engine.save(audio, out_path)
         return
@@ -1423,11 +1525,15 @@ def _run_async(coro):
 _VIENEU_LOCK = threading.Lock()   # engine ONNX dùng chung → chỉ cho 1 luồng đọc tại một thời điểm
 
 
-@st.cache_resource(show_spinner=False)
-def load_vieneu_engine():
-    """Khởi tạo VieNeu-TTS một lần (mặc định v3 Turbo 48kHz, chạy CPU/ONNX; lần đầu sẽ tự tải model)."""
+@st.cache_resource(show_spinner=False, max_entries=1)
+def load_vieneu_engine(mode_id: str = "turbo"):
+    """Khởi tạo VieNeu-TTS một lần cho mỗi chế độ (chỉ giữ 1 engine trong RAM; lần đầu sẽ tự tải model)."""
     from vieneu import Vieneu
-    return Vieneu()
+    return Vieneu(**VIENEU_MODES.get(mode_id, VIENEU_MODES["turbo"])["kwargs"])
+
+
+def get_vieneu_engine():
+    return load_vieneu_engine(current_vieneu_mode())
 
 
 def _parse_vieneu_voices(raw):
@@ -1464,7 +1570,7 @@ def synthesize_all_vieneu(items, voice_id: str, progress_cb=None):
     Trả về (tập chỉ số câu lỗi, thông báo lỗi cuối cùng)."""
     all_idx = {idx for idx, _, _ in items}
     try:
-        engine = load_vieneu_engine()
+        engine = get_vieneu_engine()
     except ImportError:
         return all_idx, "Chưa cài thư viện vieneu (pip install -U vieneu)."
     except Exception as e:  # noqa: BLE001
@@ -1766,6 +1872,71 @@ def tts_preview_fragment(label: str, voice: str, rate: str, volume: str, pitch: 
 # GIAO DIỆN CHÍNH
 # ============================================================
 
+def render_results(active_path):
+    """Hiển thị kết quả đã lưu trong session_state, nên đổi widget hay bấm tải xuống cũng không bị mất."""
+    res = st.session_state.get("result")
+    if not res or res.get("source") != active_path or not os.path.exists(res.get("video_path", "")):
+        return
+
+    for msg in res["errors"]:
+        st.error(msg)
+    for msg in res["warnings"]:
+        st.warning(msg)
+
+    segments = res["segments"]
+    thumb_bytes = res["thumb_bytes"]
+    pack_text = res["pack_text"]
+    bilingual_flag = res["bilingual"]
+
+    with st.container(key="card_result"):
+        step_header(6, "Kết quả cuối cùng", "Xem lại, tải video, phụ đề, thumbnail và gói YouTube")
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Số câu", len(segments))
+        r2.metric("Thời lượng", f"{res['out_duration']:.0f}s")
+        r3.metric("Câu lỗi TTS", res["tts_failed"])
+
+        tab_names = ["🎬 Video", "📜 Phụ đề"]
+        if thumb_bytes:
+            tab_names.append("🖼️ Thumbnail")
+        if pack_text:
+            tab_names.append("📦 Gói YouTube")
+        tabs = st.tabs(tab_names)
+
+        with tabs[0]:
+            st.video(res["video_path"])
+        with tabs[1]:
+            for seg in segments:
+                st.markdown(f"**[{seg['start']:.1f}s – {seg['end']:.1f}s]**")
+                if bilingual_flag:
+                    st.write(f"🇨🇳 {seg['text']}")
+                st.write(f"🇻🇳 {seg['translated']}")
+                st.divider()
+        tab_idx = 2
+        if thumb_bytes:
+            with tabs[tab_idx]:
+                st.image(thumb_bytes, width="stretch")
+                st.download_button("⬇️ Tải thumbnail (.jpg)", data=thumb_bytes, file_name="thumbnail.jpg",
+                                    mime="image/jpeg", width="stretch", on_click="ignore")
+            tab_idx += 1
+        if pack_text:
+            with tabs[tab_idx]:
+                st.caption("Bấm biểu tượng sao chép ở góc phải khung bên dưới. Nhớ chỉnh lại cho đúng nội dung video.")
+                st.code(pack_text, language=None)
+                st.download_button("⬇️ Tải gói YouTube (.txt)", data=pack_text, file_name="goi_youtube.txt",
+                                    mime="text/plain", width="stretch", on_click="ignore")
+
+        colA, colB = st.columns(2)
+        with colA:
+            with open(res["video_path"], "rb") as fh:
+                video_bytes = fh.read()
+            st.download_button("⬇️ Tải video kết quả", data=video_bytes, file_name="video_ket_qua.mp4",
+                                mime="video/mp4", type="primary", width="stretch", on_click="ignore")
+        with colB:
+            st.download_button("⬇️ Tải file phụ đề (.srt)", data=res["srt_content"], file_name="phu_de.srt",
+                                mime="text/plain", width="stretch", on_click="ignore")
+
+
 # ---------- BƯỚC 1: TẢI VIDEO ----------
 with st.container(key="card_upload"):
     step_header(1, "Tải video lên", "Hỗ trợ mp4, mkv, mov, avi — giới hạn dung lượng chỉnh trong .streamlit/config.toml")
@@ -1807,6 +1978,11 @@ with st.container(key="card_upload"):
             m1.metric("Độ phân giải", f"{pw0}×{ph0}")
             m2.metric("Tệp", (active_video_name[:18] + "…") if len(active_video_name) > 19 else active_video_name)
             m3.metric("Vùng phụ đề gốc", "Đã phát hiện ✅" if detected_box else "Mặc định")
+
+            _dur = ensure_video_duration(active_video_path)
+            if IS_CLOUD and ((_dur and _dur > 900) or uploaded_file.size > 300 * 1024 * 1024):
+                st.warning("⚠️ Video khá dài/nặng so với giới hạn RAM & CPU của Streamlit Cloud — có thể xử lý rất chậm "
+                           "hoặc bị ngắt giữa chừng. Nên cắt video dưới ~10 phút hoặc chạy app trên máy của bạn.")
     else:
         st.caption("👆 Tải video lên để bắt đầu — bản xem trước sẽ xuất hiện ngay bên dưới.")
 
@@ -1939,14 +2115,22 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
 
     st.divider()
     st.markdown("**🦜 Giọng VieNeu-TTS**")
+    st.selectbox(
+        "Chế độ VieNeu", [cfg["label"] for cfg in VIENEU_MODES.values()],
+        index=list(VIENEU_MODES).index(DEFAULT_VIENEU_MODE), key="vieneu_mode_label",
+        help="Nano rất nhẹ, hợp Streamlit Cloud (RAM ~1GB). Turbo cho chất lượng cao hơn nhưng nặng hơn nhiều; "
+             "Turbo int8 nhanh/nhẹ hơn nhưng cần CPU hỗ trợ VNNI. Đổi chế độ thì danh sách giọng ở bước 2 đổi theo.",
+    )
     st.caption("Cài: `pip install -U vieneu` (lần đầu dùng sẽ tự tải model). Bấm nút bên dưới để quét toàn bộ "
                "giọng có sẵn và thêm vào danh sách giọng ở bước 2.")
     if st.button("🔄 Quét tất cả giọng VieNeu có sẵn", key="btn_scan_vieneu"):
         with st.spinner("Đang khởi tạo VieNeu-TTS và lấy danh sách giọng (lần đầu có thể lâu)..."):
             try:
-                scanned = _parse_vieneu_voices(load_vieneu_engine().list_preset_voices())
+                scanned = _parse_vieneu_voices(get_vieneu_engine().list_preset_voices())
                 if scanned:
-                    st.session_state.vieneu_voices = scanned
+                    store = dict(st.session_state.get("vieneu_voices") or {})
+                    store[current_vieneu_mode()] = scanned
+                    st.session_state.vieneu_voices = store
                     st.toast(f"Đã thêm {len(scanned)} giọng VieNeu vào danh sách giọng!", icon="🦜")
                     st.rerun()
                 else:
@@ -1955,10 +2139,16 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
                 st.error("Chưa cài VieNeu-TTS. Hãy chạy: pip install -U vieneu rồi khởi động lại app.")
             except Exception as e:
                 st.error(f"Không lấy được danh sách giọng VieNeu: {type(e).__name__}: {e}")
-    if st.session_state.get("vieneu_voices"):
-        st.caption(f"Đang dùng {len(st.session_state.vieneu_voices)} giọng VieNeu đã quét.")
+    _scanned_now = (st.session_state.get("vieneu_voices") or {}).get(current_vieneu_mode())
+    if _scanned_now:
+        st.caption(f"Đang dùng {len(_scanned_now)} giọng VieNeu đã quét (chế độ hiện tại).")
 
     st.divider()
+    adv_low_ram = st.toggle(
+        "Tiết kiệm RAM (giải phóng model Whisper ngay sau khi nhận diện)", value=IS_CLOUD,
+        help="Nên bật trên Streamlit Cloud (RAM ~1GB) để không bị tràn bộ nhớ khi chạy tiếp bước lồng tiếng. "
+             "Nhược điểm: lần xử lý sau phải nạp lại model Whisper (vài giây).",
+    )
     adv_enhance_audio = st.toggle(
         "Lọc nhiễu & cân bằng âm thanh trước khi nhận diện", value=True,
         help="Cắt tiếng ù/rè, khử nhiễu nền và cân bằng âm lượng để nhận diện giọng nói chính xác hơn. "
@@ -2080,9 +2270,7 @@ if start_button:
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        ext = os.path.splitext(active_video_name or active_video_path)[1] or ".mp4"
-        input_path = os.path.join(tmp_dir, "input" + ext)
-        shutil.copy(active_video_path, input_path)
+        input_path = active_video_path   # ffmpeg chỉ đọc file này nên không cần sao chép thêm (tiết kiệm đĩa & thời gian)
 
         audio_path = os.path.join(tmp_dir, "audio.wav")
         srt_path = os.path.join(tmp_dir, "output.srt")
@@ -2103,11 +2291,17 @@ if start_button:
                 total_duration = ffprobe_duration(input_path)
 
                 st.write(f"🗣️ Đang nhận diện giọng nói tiếng Trung (model {model_size})...")
+                st.write("⏳ Đang nạp model Whisper (lần đầu sẽ tải về, có thể mất vài phút)...")
+                load_whisper_model(model_size)
                 transcribe_placeholder = st.empty()
                 segments = transcribe_audio(
                     audio_path, model_size, beam_size=speed_cfg["beam_size"],
                     progress_cb=lambda t, text: transcribe_placeholder.write(f"  [{t:.1f}s] {text}")
                 )
+
+                if adv_low_ram:
+                    load_whisper_model.clear()   # trả RAM trước khi chạy TTS / ffmpeg
+                    gc.collect()
 
                 if not segments:
                     status.update(label="Không nhận diện được giọng nói nào.", state="error")
@@ -2251,75 +2445,53 @@ if start_button:
             st.error(f"❌ Lỗi không mong muốn: {e}")
             st.stop()
 
+        errors_list, warnings_list = [], []
         if dub_error:
-            st.error(
+            errors_list.append(
                 "❌ Không tạo được giọng lồng tiếng AI tiếng Việt nên video đang giữ nguyên âm thanh gốc.\n\n"
                 f"Nguyên nhân: {dub_error}"
             )
         elif dub_warning_count > 0:
-            st.warning(
+            warnings_list.append(
                 f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
                 "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
             )
         if dub_notice:
-            st.warning(f"⚠️ {dub_notice}")
+            warnings_list.append(f"⚠️ {dub_notice}")
         if untranslated_count > 0:
-            st.warning(
+            warnings_list.append(
                 f"⚠️ {untranslated_count} câu không dịch được sang tiếng Việt (có thể do mạng chập chờn) — "
                 "các câu này giữ nguyên chữ Trung trong phụ đề và không được lồng tiếng."
             )
         for note in finish_notes:
-            st.warning(f"⚠️ {note}")
+            warnings_list.append(f"⚠️ {note}")
 
-        with open(current_video, "rb") as f:
-            video_bytes = f.read()
+        # Lưu video kết quả ra thư mục làm việc của phiên (thư mục tạm của lần chạy sắp bị xoá) và chỉ giữ ĐƯỜNG DẪN
+        # trong session_state, không giữ cả file video trong RAM.
+        old_res = st.session_state.get("result")
+        if old_res and old_res.get("video_path"):
+            try:
+                os.remove(old_res["video_path"])
+            except OSError:
+                pass
+        result_path = os.path.join(ensure_workdir(), f"result_{int(time.time())}.mp4")
+        shutil.copy(current_video, result_path)
 
+        st.session_state["result"] = {
+            "source": active_video_path,
+            "video_path": result_path,
+            "segments": segments,
+            "srt_content": srt_content,
+            "bilingual": bilingual,
+            "thumb_bytes": thumb_bytes,
+            "pack_text": pack_text,
+            "out_duration": total_duration / v_speed,
+            "tts_failed": dub_warning_count,
+            "errors": errors_list,
+            "warnings": warnings_list,
+        }
         st.toast("Xử lý xong!", icon="✅")
 
-        with st.container(key="card_result"):
-            step_header(6, "Kết quả cuối cùng", "Xem lại, tải video, phụ đề, thumbnail và gói YouTube")
-
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Số câu", len(segments))
-            r2.metric("Thời lượng", f"{total_duration / v_speed:.0f}s")
-            r3.metric("Câu lỗi TTS", dub_warning_count)
-
-            tab_names = ["🎬 Video", "📜 Phụ đề"]
-            if thumb_bytes:
-                tab_names.append("🖼️ Thumbnail")
-            if pack_text:
-                tab_names.append("📦 Gói YouTube")
-            tabs = st.tabs(tab_names)
-
-            with tabs[0]:
-                st.video(video_bytes)
-            with tabs[1]:
-                for seg in segments:
-                    st.markdown(f"**[{seg['start']:.1f}s – {seg['end']:.1f}s]**")
-                    if bilingual:
-                        st.write(f"🇨🇳 {seg['text']}")
-                    st.write(f"🇻🇳 {seg['translated']}")
-                    st.divider()
-            tab_idx = 2
-            if thumb_bytes:
-                with tabs[tab_idx]:
-                    st.image(thumb_bytes, width="stretch")
-                    st.download_button("⬇️ Tải thumbnail (.jpg)", data=thumb_bytes, file_name="thumbnail.jpg",
-                                        mime="image/jpeg", width="stretch", on_click="ignore")
-                tab_idx += 1
-            if pack_text:
-                with tabs[tab_idx]:
-                    st.caption("Bấm biểu tượng sao chép ở góc phải khung bên dưới. Nhớ chỉnh lại cho đúng nội dung video.")
-                    st.code(pack_text, language=None)
-                    st.download_button("⬇️ Tải gói YouTube (.txt)", data=pack_text, file_name="goi_youtube.txt",
-                                        mime="text/plain", width="stretch", on_click="ignore")
-
-            colA, colB = st.columns(2)
-            with colA:
-                st.download_button("⬇️ Tải video kết quả", data=video_bytes, file_name="video_ket_qua.mp4",
-                                    mime="video/mp4", type="primary", width="stretch", on_click="ignore")
-            with colB:
-                st.download_button("⬇️ Tải file phụ đề (.srt)", data=srt_content, file_name="phu_de.srt",
-                                    mime="text/plain", width="stretch", on_click="ignore")
+render_results(active_video_path)
 
 st.html('<div class="footer">Made with Streamlit · Whisper · edge-tts · VieNeu-TTS · ffmpeg</div>')
