@@ -1,11 +1,14 @@
 """
-Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ + VIRAL BOOST.
+Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ + VIRAL BOOST + VIENEU-TTS.
 
 Người dùng chỉ cần: tải video → chọn cỡ chữ → chọn màu chữ → chọn giọng đọc.
 Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI, hạ âm lượng gốc,
 màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
 
 BẢN NÀY CÓ GÌ MỚI
+    - THÊM GIỌNG AI VieNeu-TTS (github.com/pnnbao97/VieNeu-TTS): giọng Việt tự nhiên, chạy offline
+      trên CPU (ONNX), nằm chung danh sách giọng với edge-tts. Có nút quét toàn bộ giọng có sẵn.
+      Nếu VieNeu chưa cài / lỗi → tự chuyển sang edge-tts rồi gTTS nên video không bao giờ hỏng.
     - SỬA LỖI KHÔNG DỊCH RA TIẾNG VIỆT: dịch bằng 3 nguồn dự phòng (Google trực tiếp →
       deep_translator → MyMemory), kiểm tra kết quả thật sự là tiếng Việt, tự thử lại,
       báo lỗi rõ ràng thay vì âm thầm giữ chữ Trung.
@@ -22,6 +25,7 @@ BẢN NÀY CÓ GÌ MỚI
 CÀI ĐẶT:
     pip install -r requirements.txt        # cần streamlit >= 1.50
     pip install -U edge-tts gTTS deep-translator
+    pip install -U vieneu                  # (tuỳ chọn) giọng VieNeu-TTS, lần đầu chạy sẽ tự tải model
     # cần ffmpeg: sudo apt install ffmpeg / brew install ffmpeg
 
 CHẠY:
@@ -29,7 +33,7 @@ CHẠY:
 
 CẤU TRÚC THƯ MỤC:
     app.py
-    requirements.txt
+    requirements.txt            (thêm dòng: vieneu)
     packages.txt                (Streamlit Cloud: ffmpeg, fonts-dejavu-core)
     .streamlit/config.toml      (theme tối + nâng giới hạn upload lên 2GB)
 """
@@ -237,6 +241,7 @@ st.html("""
   <div class="chips">
     <span class="chip">🔎 Tự phát hiện phụ đề gốc</span>
     <span class="chip">🎙️ Lồng tiếng AI</span>
+    <span class="chip">🦜 Giọng VieNeu-TTS</span>
     <span class="chip">🚀 Viral Boost</span>
     <span class="chip">🖼️ Thumbnail & mô tả YouTube</span>
   </div>
@@ -254,6 +259,22 @@ VOICE_STYLE_OPTIONS = {
     "👨 Nam Minh - Nhanh, dứt khoát": {"voice": "vi-VN-NamMinhNeural", "rate": 15,  "pitch": 2},
     "👨 Nam Minh - Trẻ trung, cao":  {"voice": "vi-VN-NamMinhNeural", "rate": 5,   "pitch": 6},
 }
+
+# ---------- GIỌNG VieNeu-TTS (github.com/pnnbao97/VieNeu-TTS) ----------
+# Danh sách mặc định (đã có sẵn trong gói vieneu). Bấm nút "Quét giọng VieNeu" trong phần
+# Tuỳ chỉnh nâng cao để lấy toàn bộ giọng có thật trong bản vieneu đang cài trên máy.
+VIENEU_STATIC_VOICES = [("Hải Đăng", "Hải Đăng"), ("Minh Quân", "Minh Quân")]
+EDGE_FALLBACK_VOICE = "vi-VN-HoaiMyNeural"   # giọng dự phòng khi VieNeu chưa cài / lỗi
+
+
+def get_voice_options():
+    """Giọng edge-tts + giọng VieNeu-TTS (nếu đã quét thì dùng danh sách quét được)."""
+    options = dict(VOICE_STYLE_OPTIONS)
+    vieneu_voices = st.session_state.get("vieneu_voices") or VIENEU_STATIC_VOICES
+    for label, voice_id in vieneu_voices:
+        options[f"🦜 VieNeu - {label}"] = {"engine": "vieneu", "voice": voice_id, "rate": 0, "pitch": 0}
+    return options
+
 
 POSITION_OPTIONS = {"Dưới (mặc định)": 2, "Giữa màn hình": 5, "Trên": 8}
 
@@ -1348,7 +1369,12 @@ def render_text_overlays_preview(img: "Image.Image", hook_text: str, watermark_t
 
 
 def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, out_path: str,
-                                sample_text: str = SAMPLE_TTS_TEXT):
+                                sample_text: str = SAMPLE_TTS_TEXT, engine: str = "edge"):
+    if engine == "vieneu":
+        vieneu_engine = load_vieneu_engine()
+        audio = _vieneu_infer(vieneu_engine, sample_text, voice)
+        vieneu_engine.save(audio, out_path)
+        return
     import edge_tts
     communicate = edge_tts.Communicate(sample_text, voice=voice, rate=rate, volume=volume, pitch=pitch)
     _run_async(communicate.save(out_path))
@@ -1390,6 +1416,82 @@ def _run_async(coro):
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+# ---------- VieNeu-TTS (github.com/pnnbao97/VieNeu-TTS) ----------
+
+_VIENEU_LOCK = threading.Lock()   # engine ONNX dùng chung → chỉ cho 1 luồng đọc tại một thời điểm
+
+
+@st.cache_resource(show_spinner=False)
+def load_vieneu_engine():
+    """Khởi tạo VieNeu-TTS một lần (mặc định v3 Turbo 48kHz, chạy CPU/ONNX; lần đầu sẽ tự tải model)."""
+    from vieneu import Vieneu
+    return Vieneu()
+
+
+def _parse_vieneu_voices(raw):
+    """Chuẩn hoá kết quả list_preset_voices() thành [(nhãn hiển thị, id giọng)]."""
+    voices = []
+    for v in raw or []:
+        if isinstance(v, (tuple, list)) and v:
+            label = str(v[0])
+            voice_id = str(v[1]) if len(v) > 1 and v[1] else label
+        elif isinstance(v, dict):
+            label = str(v.get("label") or v.get("name") or v.get("id") or "")
+            voice_id = str(v.get("id") or v.get("voice_id") or label)
+        else:
+            label = voice_id = str(v)
+        if label:
+            voices.append((label, voice_id))
+    return voices
+
+
+def _vieneu_infer(engine, text: str, voice_id: str):
+    """Đọc 1 câu bằng giọng preset. Nếu truyền tên không được thì thử lại bằng get_preset_voice()."""
+    with _VIENEU_LOCK:
+        try:
+            return engine.infer(text, voice=voice_id)
+        except Exception as first_err:  # noqa: BLE001
+            try:
+                return engine.infer(text, voice=engine.get_preset_voice(voice_id))
+            except Exception:  # noqa: BLE001
+                raise first_err
+
+
+def synthesize_all_vieneu(items, voice_id: str, progress_cb=None):
+    """Tạo giọng đọc bằng VieNeu-TTS (lần lượt từng câu, ghi file .wav).
+    Trả về (tập chỉ số câu lỗi, thông báo lỗi cuối cùng)."""
+    all_idx = {idx for idx, _, _ in items}
+    try:
+        engine = load_vieneu_engine()
+    except ImportError:
+        return all_idx, "Chưa cài thư viện vieneu (pip install -U vieneu)."
+    except Exception as e:  # noqa: BLE001
+        return all_idx, f"Không khởi tạo được VieNeu-TTS: {type(e).__name__}: {e}"
+
+    failed_indices = set()
+    errors = []
+    for n, (idx, text, raw_path) in enumerate(items, start=1):
+        success = False
+        for _attempt in range(2):
+            try:
+                audio = _vieneu_infer(engine, text, voice_id)
+                engine.save(audio, raw_path)
+                if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                    success = True
+                    break
+                errors.append("VieNeu trả về file rỗng")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+        if not success:
+            failed_indices.add(idx)
+        if progress_cb:
+            try:
+                progress_cb(n, len(items))
+            except Exception:
+                pass
+    return failed_indices, (errors[-1] if errors else "")
 
 
 def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
@@ -1511,40 +1613,75 @@ def _read_wav_mono_float(path: str) -> "np.ndarray":
     return arr
 
 
+def _to_mp3_items(items, failed_indices, tmp_dir: str, raw_paths: dict):
+    """Tạo danh sách (idx, text, đường dẫn .mp3) cho các câu cần đọc lại bằng giọng dự phòng
+    (edge-tts / gTTS), đồng thời cập nhật raw_paths để bước ghép biết file nào dùng cho câu nào."""
+    retry = []
+    for idx, text, _ in items:
+        if idx in failed_indices:
+            p = os.path.join(tmp_dir, f"tts_raw_{idx}.mp3")
+            raw_paths[idx] = p
+            retry.append((idx, text, p))
+    return retry
+
+
 def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
-                     tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None):
-    """Trả về (đường dẫn track lồng tiếng hoặc None nếu không tạo được câu nào, tập câu lỗi, thông báo lỗi)."""
+                     tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None,
+                     engine: str = "edge"):
+    """Trả về (đường dẫn track lồng tiếng hoặc None nếu không tạo được câu nào, tập câu lỗi, thông báo lỗi).
+    engine = "edge" (edge-tts) hoặc "vieneu" (VieNeu-TTS). Với VieNeu, câu nào hỏng sẽ tự chuyển sang
+    edge-tts rồi gTTS; ghi chú về việc dùng giọng dự phòng được lưu ở st.session_state["_dub_notice"]."""
+    ext = ".wav" if engine == "vieneu" else ".mp3"
     items = []
     for i, seg in enumerate(segments):
         text = seg["translated"].strip()
         # Câu chưa dịch được (vẫn là chữ Trung) thì không đưa cho giọng Việt đọc.
         if text and seg.get("translated_ok", True):
-            raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
+            raw_path = os.path.join(tmp_dir, f"tts_raw_{i}{ext}")
             items.append((i, text, raw_path))
 
     if not items:
         return None, set(), "Không có câu nào đã được dịch sang tiếng Việt để lồng tiếng."
 
-    failed_indices, last_error = synthesize_all_tts(items, voice, rate, volume, pitch,
-                                                     concurrency=concurrency, progress_cb=progress_cb)
+    raw_paths = {idx: p for idx, _, p in items}
+    notice = None
 
-    # Edge-tts hỏng câu nào → thử gTTS cho câu đó.
+    if engine == "vieneu":
+        failed_indices, last_error = synthesize_all_vieneu(items, voice, progress_cb=progress_cb)
+        if failed_indices:
+            # VieNeu hỏng (chưa cài / lỗi) → đọc lại các câu đó bằng edge-tts.
+            retry_items = _to_mp3_items(items, failed_indices, tmp_dir, raw_paths)
+            notice = (f"VieNeu-TTS không đọc được {len(failed_indices)}/{len(items)} câu "
+                      f"nên các câu đó dùng giọng dự phòng ({EDGE_FALLBACK_VOICE}). "
+                      f"Lý do: {last_error or 'không rõ'}")
+            failed_indices, edge_err = synthesize_all_tts(retry_items, EDGE_FALLBACK_VOICE, "+0%", "+0%", "+0Hz",
+                                                           concurrency=concurrency)
+            if failed_indices and edge_err:
+                last_error = f"{last_error} | {edge_err}" if last_error else edge_err
+    else:
+        failed_indices, last_error = synthesize_all_tts(items, voice, rate, volume, pitch,
+                                                         concurrency=concurrency, progress_cb=progress_cb)
+
+    # Vẫn còn câu hỏng → thử gTTS cho câu đó.
     if failed_indices:
-        retry_items = [it for it in items if it[0] in failed_indices]
+        retry_items = _to_mp3_items(items, failed_indices, tmp_dir, raw_paths)
         failed_indices, gtts_err = _gtts_fallback(retry_items)
         if failed_indices and gtts_err:
             last_error = f"{last_error} | {gtts_err}" if last_error else gtts_err
 
+    st.session_state["_dub_notice"] = notice
+
     if len(failed_indices) >= len(items):
-        hint = (" Gợi ý: chạy 'pip install -U edge-tts gTTS' và kiểm tra kết nối Internet.")
+        hint = (" Gợi ý: chạy 'pip install -U edge-tts gTTS vieneu' và kiểm tra kết nối Internet.")
         return None, failed_indices, (last_error or "Không rõ nguyên nhân") + hint
 
     # Chống chồng tiếng: câu sau không bao giờ bắt đầu sớm hơn thời điểm câu trước kết thúc ("cursor").
     placed = []   # (start_time, numpy audio)
     cursor = 0.0
-    for idx, text, raw_path in items:
+    for idx, text, _unused_path in items:
         if idx in failed_indices:
             continue
+        raw_path = raw_paths[idx]
         seg = segments[idx]
         slot_duration = max(seg["end"] - seg["start"], 0.3)
         fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
@@ -1604,20 +1741,25 @@ def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: st
 # ============================================================
 
 @st.fragment
-def tts_preview_fragment(label: str, voice: str, rate: str, volume: str, pitch: str):
+def tts_preview_fragment(label: str, voice: str, rate: str, volume: str, pitch: str, engine: str = "edge"):
     st.markdown(f"**🔊 Nghe thử giọng đọc:** {label}")
     if st.button("▶️ Nghe thử giọng đọc mẫu", key="btn_tts_preview", width="stretch"):
-        with st.spinner("Đang tạo giọng đọc mẫu..."):
+        spinner_text = ("Đang tạo giọng đọc mẫu (lần đầu dùng VieNeu sẽ tải model, hơi lâu)..."
+                        if engine == "vieneu" else "Đang tạo giọng đọc mẫu...")
+        with st.spinner(spinner_text):
             try:
-                tts_preview_path = os.path.join(st.session_state.workdir, "tts_preview.mp3")
-                generate_tts_preview_audio(voice, rate, volume, pitch, tts_preview_path)
+                preview_ext = "wav" if engine == "vieneu" else "mp3"
+                tts_preview_path = os.path.join(st.session_state.workdir, f"tts_preview.{preview_ext}")
+                generate_tts_preview_audio(voice, rate, volume, pitch, tts_preview_path, engine=engine)
                 with open(tts_preview_path, "rb") as f:
                     st.session_state.tts_preview_bytes = f.read()
+                st.session_state.tts_preview_format = f"audio/{preview_ext}"
             except Exception as e:
-                st.error(f"Không tạo được giọng đọc mẫu: {e}  — thử chạy: pip install -U edge-tts")
+                hint = "pip install -U vieneu" if engine == "vieneu" else "pip install -U edge-tts"
+                st.error(f"Không tạo được giọng đọc mẫu: {e}  — thử chạy: {hint}")
                 st.session_state.tts_preview_bytes = None
     if st.session_state.get("tts_preview_bytes"):
-        st.audio(st.session_state.tts_preview_bytes, format="audio/mp3")
+        st.audio(st.session_state.tts_preview_bytes, format=st.session_state.get("tts_preview_format", "audio/mp3"))
 
 
 # ============================================================
@@ -1684,8 +1826,13 @@ with st.container(key="card_style"):
     with c2:
         text_color = st.color_picker("🎨 Màu chữ phụ đề", "#FFFFFF")
 
-    voice_style_label = st.selectbox("🎙️ Giọng đọc lồng tiếng AI", list(VOICE_STYLE_OPTIONS.keys()))
-    voice_style = VOICE_STYLE_OPTIONS[voice_style_label]
+    voice_options = get_voice_options()
+    voice_style_label = st.selectbox(
+        "🎙️ Giọng đọc lồng tiếng AI", list(voice_options.keys()),
+        help="👩👨 = edge-tts (cần Internet). 🦜 = VieNeu-TTS (chạy offline trên máy, cần: pip install vieneu; "
+             "lần đầu dùng sẽ tải model). Nếu VieNeu lỗi, app tự chuyển sang giọng Hoài My để video không bị hỏng.",
+    )
+    voice_style = voice_options[voice_style_label]
 
 outline_color = auto_outline_color(text_color)
 
@@ -1791,6 +1938,27 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
                                    disabled=not adv_override_bg_volume)
 
     st.divider()
+    st.markdown("**🦜 Giọng VieNeu-TTS**")
+    st.caption("Cài: `pip install -U vieneu` (lần đầu dùng sẽ tự tải model). Bấm nút bên dưới để quét toàn bộ "
+               "giọng có sẵn và thêm vào danh sách giọng ở bước 2.")
+    if st.button("🔄 Quét tất cả giọng VieNeu có sẵn", key="btn_scan_vieneu"):
+        with st.spinner("Đang khởi tạo VieNeu-TTS và lấy danh sách giọng (lần đầu có thể lâu)..."):
+            try:
+                scanned = _parse_vieneu_voices(load_vieneu_engine().list_preset_voices())
+                if scanned:
+                    st.session_state.vieneu_voices = scanned
+                    st.toast(f"Đã thêm {len(scanned)} giọng VieNeu vào danh sách giọng!", icon="🦜")
+                    st.rerun()
+                else:
+                    st.warning("VieNeu không trả về giọng nào, đang dùng danh sách mặc định.")
+            except ImportError:
+                st.error("Chưa cài VieNeu-TTS. Hãy chạy: pip install -U vieneu rồi khởi động lại app.")
+            except Exception as e:
+                st.error(f"Không lấy được danh sách giọng VieNeu: {type(e).__name__}: {e}")
+    if st.session_state.get("vieneu_voices"):
+        st.caption(f"Đang dùng {len(st.session_state.vieneu_voices)} giọng VieNeu đã quét.")
+
+    st.divider()
     adv_enhance_audio = st.toggle(
         "Lọc nhiễu & cân bằng âm thanh trước khi nhận diện", value=True,
         help="Cắt tiếng ù/rè, khử nhiễu nền và cân bằng âm lượng để nhận diện giọng nói chính xác hơn. "
@@ -1822,6 +1990,7 @@ blur_strength = adv_blur_strength
 enable_dub = not adv_disable_dub
 keep_bg = adv_keep_bg
 voice = voice_style["voice"]
+tts_engine = voice_style.get("engine", "edge")
 tts_rate_pct = voice_style["rate"]
 tts_volume_pct = 0
 tts_pitch_hz = voice_style["pitch"]
@@ -1895,6 +2064,7 @@ with st.container(key="card_preview"):
                 f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%",
                 f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%",
                 f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz",
+                engine=tts_engine,
             )
 
 # ---------- BƯỚC 5: XỬ LÝ ----------
@@ -1923,6 +2093,7 @@ if start_button:
         pack_text = None
         dub_warning_count = 0
         dub_error = None
+        dub_notice = None
         untranslated_count = 0
 
         try:
@@ -2001,18 +2172,25 @@ if start_button:
                     current_video = processed_output
 
                 if enable_dub:
-                    st.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
+                    if tts_engine == "vieneu":
+                        st.write(f"🦜 Đang tạo giọng đọc VieNeu-TTS ({voice_style_label}) — đọc lần lượt từng câu, "
+                                 "lần đầu có thể phải tải model nên hơi lâu...")
+                    else:
+                        st.write(f"🎙️ Đang tạo giọng đọc AI ({voice_style_label}, song song nhiều luồng)...")
                     tts_bar = st.progress(0, text="Đang tạo giọng đọc...")
                     rate_str = f"{'+' if tts_rate_pct >= 0 else ''}{tts_rate_pct}%"
                     volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
                     pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
 
+                    st.session_state["_dub_notice"] = None
                     dub_track_path, failed_indices, tts_error = build_dub_track(
                         segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
                         concurrency=speed_cfg["tts_concurrency"],
-                        progress_cb=lambda d, t: tts_bar.progress(d / t, text=f"Đã đọc {d}/{t} câu")
+                        progress_cb=lambda d, t: tts_bar.progress(d / t, text=f"Đã đọc {d}/{t} câu"),
+                        engine=tts_engine,
                     )
                     dub_warning_count = len(failed_indices)
+                    dub_notice = st.session_state.pop("_dub_notice", None)
 
                     if dub_track_path is None:
                         # Không tạo được giọng đọc nào → giữ nguyên âm thanh gốc, báo lỗi rõ ràng sau khi xong.
@@ -2083,6 +2261,8 @@ if start_button:
                 f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
                 "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
             )
+        if dub_notice:
+            st.warning(f"⚠️ {dub_notice}")
         if untranslated_count > 0:
             st.warning(
                 f"⚠️ {untranslated_count} câu không dịch được sang tiếng Việt (có thể do mạng chập chờn) — "
@@ -2142,4 +2322,4 @@ if start_button:
                 st.download_button("⬇️ Tải file phụ đề (.srt)", data=srt_content, file_name="phu_de.srt",
                                     mime="text/plain", width="stretch", on_click="ignore")
 
-st.html('<div class="footer">Made with Streamlit · Whisper · edge-tts · ffmpeg</div>')
+st.html('<div class="footer">Made with Streamlit · Whisper · edge-tts · VieNeu-TTS · ffmpeg</div>')
