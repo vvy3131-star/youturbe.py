@@ -1,20 +1,8 @@
-
-        streamlit>=1.50
+streamlit>=1.50
         faster-whisper
         numpy
         Pillow
         edge-tts
         gTTS
         deep-translator
-        vieneu                 # bỏ dòng này nếu không dùng giọng VieNeu
-    packages.txt:
-        ffmpeg
-        fonts-dejavu-core
-    .streamlit/config.toml:
-        [server]
-        maxUploadSize = 300
-        fileWatcherType = "none"
-        [browser]
-        gatherUsageStats = false
-        [theme]
-        base = "dark"
+        vieneu        
