@@ -19,3 +19,4 @@ deep-translator
 edge-tts
 Pillow
 numpy
+vieneu
