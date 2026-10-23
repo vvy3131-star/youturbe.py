@@ -6,6 +6,11 @@ Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI
 màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
 
 BẢN NÀY CÓ GÌ MỚI
+    - DỊCH SÁT NGHĨA: dịch theo ngữ cảnh cả đoạn hội thoại bằng Claude (nhập API key
+      ở "Tuỳ chỉnh nâng cao" hoặc đặt biến môi trường ANTHROPIC_API_KEY / st.secrets).
+      Câu dịch tự nhiên như người Trung nói chuyện với nhau, giữ nhất quán xưng hô,
+      hiểu thành ngữ/tiếng lóng, sửa lỗi nhận diện nhẹ. Không có key hoặc API lỗi thì
+      tự động dùng Google Translate như trước.
     - Sửa lỗi "open() got an unexpected keyword argument 'metadata_errors'":
       app tự đọc file wav 16kHz rồi đưa thẳng mảng số cho faster-whisper, không
       còn phụ thuộc vào hàm giải mã av.open() của thư viện PyAV nữa.
@@ -18,6 +23,7 @@ BẢN NÀY CÓ GÌ MỚI
 CÀI ĐẶT:
     pip install -r requirements.txt        # cần streamlit >= 1.50
     # cần ffmpeg: sudo apt install ffmpeg / brew install ffmpeg
+    # dịch bằng Claude không cần cài thêm thư viện (dùng urllib có sẵn)
 
 CHẠY:
     streamlit run app.py
@@ -27,16 +33,19 @@ CẤU TRÚC THƯ MỤC:
     requirements.txt
     packages.txt                (Streamlit Cloud: ffmpeg, fonts-dejavu-core)
     .streamlit/config.toml      (theme tối + nâng giới hạn upload lên 2GB)
+    .streamlit/secrets.toml     (tuỳ chọn: ANTHROPIC_API_KEY = "sk-ant-...")
 """
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import urllib.request
 import wave
 
 import numpy as np
@@ -377,14 +386,144 @@ def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 3, progr
     return results
 
 
-def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
+# ============================================================
+# DỊCH THUẬT — SÁT NGHĨA, THEO NGỮ CẢNH (Claude) + dự phòng Google
+# ============================================================
+
+TRANSLATE_MODEL = "claude-sonnet-5-5"
+
+TRANSLATE_SYSTEM_PROMPT = """Bạn là biên dịch viên phụ đề chuyên nghiệp Trung → Việt, dịch lời thoại trong video.
+
+MỤC TIÊU: người Việt xem phải hiểu ngay và tự nhiên như người Trung đang nói chuyện với nhau.
+
+NGUYÊN TẮC:
+1. SÁT NGHĨA: dịch đúng ý, đúng sắc thái (đùa, mỉa mai, tức giận, thân mật, trang trọng). Không thêm, không bỏ ý.
+2. TỰ NHIÊN: dùng văn nói tiếng Việt đời thường, KHÔNG dịch word-by-word, KHÔNG văn dịch cứng. Đảo trật tự câu cho đúng cách người Việt nói.
+3. THÀNH NGỮ / TIẾNG LÓNG / MẠNG: dịch theo nghĩa thực, dùng cách nói tương đương của người Việt (vd 绝了 = đỉnh thật / tuyệt thật, 无语 = cạn lời, 离谱 = vô lý hết sức). Không dịch nghĩa đen.
+4. XƯNG HÔ: dựa vào ngữ cảnh các câu xung quanh để chọn xưng hô hợp lý (tôi/tớ/mình/anh/chị/em/bạn/ông/bà...) và GIỮ NHẤT QUÁN trong toàn video. Mặc định trung tính là "tôi - bạn" hoặc "mình - bạn".
+5. LỖI NHẬN DIỆN GIỌNG NÓI: văn bản gốc do AI nhận diện nên có thể sai chữ đồng âm. Hãy suy luận từ ngữ cảnh để dịch đúng ý người nói thật sự.
+6. NGẮN GỌN: câu dịch được đọc lồng tiếng đúng khung thời gian của câu gốc, nên giữ độ dài tương đương hoặc ngắn hơn, bỏ từ thừa, không giải thích.
+7. Tên riêng người/địa danh: dùng âm Hán Việt cho tên Trung Quốc quen thuộc (习近平 = Tập Cận Bình), tên thương hiệu giữ nguyên.
+8. Số, đơn vị, tiền tệ: dịch chính xác (万 = chục nghìn, 亿 = trăm triệu).
+
+ĐỊNH DẠNG: chỉ trả về MỘT mảng JSON gồm các chuỗi, đúng thứ tự và đúng số lượng câu cần dịch. Không markdown, không giải thích."""
+
+
+def _clean_zh_text(text: str) -> str:
+    """Dọn lỗi hay gặp của Whisper: lặp ký tự/cụm, khoảng trắng thừa."""
+    text = " ".join(text.split())
+    text = re.sub(r"(.)\1{4,}", r"\1\1\1", text)
+    text = re.sub(r"(.{2,8}?)\1{3,}", r"\1\1", text)
+    return text.strip()
+
+
+def _clean_vi_text(text: str) -> str:
+    text = " ".join(str(text).split())
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    return text.strip()
+
+
+def _get_claude_api_key() -> str:
+    key = str(st.session_state.get("claude_api_key", "") or "").strip()
+    if key:
+        return key
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("ANTHROPIC_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def _call_claude(api_key: str, system: str, user_text: str, max_tokens: int = 4000) -> str:
+    body = json.dumps({
+        "model": TRANSLATE_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "system": system,
+        "messages": [{"role": "user", "content": user_text}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body, method="POST",
+        headers={"content-type": "application/json", "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+
+
+def _parse_json_array(raw: str):
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    start, end = raw.find("["), raw.rfind("]")
+    if start == -1 or end == -1:
+        raise ValueError("Không có mảng JSON")
+    arr = json.loads(raw[start:end + 1])
+    if not isinstance(arr, list):
+        raise ValueError("Kết quả không phải mảng")
+    return [str(x) for x in arr]
+
+
+def _translate_with_claude(segments, api_key: str, progress_cb=None, chunk_size: int = 25, ctx: int = 4):
+    """Dịch theo cụm câu, kèm vài câu trước/sau làm ngữ cảnh để hiểu đúng ý và xưng hô."""
+    texts = [_clean_zh_text(s["text"]) for s in segments]
+    out = [None] * len(texts)
+    prev_tail = []  # (zh, vi) vài câu đã dịch ngay trước, giữ nhất quán xưng hô
+
+    for start in range(0, len(texts), chunk_size):
+        chunk = texts[start:start + chunk_size]
+        after = texts[start + chunk_size:start + chunk_size + ctx]
+
+        parts = []
+        if prev_tail:
+            parts.append("NGỮ CẢNH TRƯỚC (đã dịch, chỉ để tham khảo, KHÔNG dịch lại):\n" +
+                         "\n".join(f"{zh} => {vi}" for zh, vi in prev_tail))
+        parts.append(f"CẦN DỊCH ({len(chunk)} câu, trả về mảng JSON đúng {len(chunk)} chuỗi):\n" +
+                     json.dumps(chunk, ensure_ascii=False))
+        if after:
+            parts.append("NGỮ CẢNH SAU (chỉ để tham khảo, KHÔNG dịch):\n" + "\n".join(after))
+        user_text = "\n\n".join(parts)
+
+        result = None
+        for attempt in range(3):
+            try:
+                result = _parse_json_array(_call_claude(api_key, TRANSLATE_SYSTEM_PROMPT, user_text))
+                if len(result) == len(chunk):
+                    break
+                result = None
+            except Exception:
+                result = None
+        if result is None:
+            # Lỗi mạng/API hoặc lệch số câu: dịch từng câu một cho cụm này
+            result = []
+            for zh in chunk:
+                try:
+                    one = _parse_json_array(_call_claude(
+                        api_key, TRANSLATE_SYSTEM_PROMPT,
+                        f"CẦN DỊCH (1 câu):\n{json.dumps([zh], ensure_ascii=False)}", 800))
+                    result.append(one[0] if one else "")
+                except Exception:
+                    result.append("")
+
+        for i, vi in enumerate(result):
+            out[start + i] = _clean_vi_text(vi) if vi.strip() else None
+        prev_tail = [(chunk[i], out[start + i]) for i in range(max(0, len(chunk) - ctx), len(chunk))
+                     if out[start + i]]
+
+        if progress_cb:
+            progress_cb(min(start + chunk_size, len(texts)), len(texts))
+    return out
+
+
+def _translate_with_google(segments, progress_cb=None, chunk_size: int = 40):
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source="zh-CN", target="vi")
 
-    texts = [seg["text"] for seg in segments]
+    texts = [_clean_zh_text(s["text"]) for s in segments]
     translated_all = [None] * len(segments)
 
-    done = 0
     for start in range(0, len(texts), chunk_size):
         chunk = texts[start:start + chunk_size]
         try:
@@ -394,20 +533,47 @@ def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
 
         if batch_result and len(batch_result) == len(chunk):
             for i, t in enumerate(batch_result):
-                translated_all[start + i] = t if t else chunk[i]
+                translated_all[start + i] = _clean_vi_text(t) if t else None
         else:
             for i, text in enumerate(chunk):
                 try:
-                    translated_all[start + i] = translator.translate(text)
+                    translated_all[start + i] = _clean_vi_text(translator.translate(text))
                 except Exception:
-                    translated_all[start + i] = text
-
-        done = min(start + chunk_size, len(texts))
+                    translated_all[start + i] = None
         if progress_cb:
-            progress_cb(done, len(texts))
+            progress_cb(min(start + chunk_size, len(texts)), len(texts))
+    return translated_all
+
+
+def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
+    """Có Claude API key → dịch sát nghĩa theo ngữ cảnh; không có hoặc lỗi → Google Translate."""
+    api_key = _get_claude_api_key()
+    translated_all = None
+    engine = "google"
+
+    if api_key:
+        try:
+            translated_all = _translate_with_claude(segments, api_key, progress_cb=progress_cb)
+            engine = "claude"
+        except Exception:
+            translated_all = None
+
+    if translated_all is None:
+        translated_all = _translate_with_google(segments, progress_cb=progress_cb, chunk_size=chunk_size)
+
+    # Câu nào Claude trả rỗng thì bù bằng Google để không bị thiếu thoại
+    if engine == "claude" and any(t is None for t in translated_all):
+        missing = [i for i, t in enumerate(translated_all) if t is None]
+        try:
+            fallback = _translate_with_google([segments[i] for i in missing])
+            for i, t in zip(missing, fallback):
+                translated_all[i] = t
+        except Exception:
+            pass
 
     for seg, translated in zip(segments, translated_all):
         seg["translated"] = translated if translated else seg["text"]
+    st.session_state["_translate_engine"] = engine
     return segments
 
 
@@ -1476,6 +1642,14 @@ with st.container(key="card_viral"):
 with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
     st.caption("Chỉ mở phần này nếu bạn muốn tự tay ghi đè các lựa chọn tự động.")
 
+    st.text_input(
+        "🔑 Claude API key (dịch sát nghĩa nhất)", type="password", key="claude_api_key",
+        placeholder="sk-ant-... (để trống = dùng Google Translate)",
+        help="Có key thì app dịch bằng Claude theo ngữ cảnh: sát nghĩa, tự nhiên, nhất quán xưng hô. "
+             "Cũng có thể đặt biến môi trường ANTHROPIC_API_KEY hoặc st.secrets để khỏi nhập lại.",
+    )
+    st.divider()
+
     t1, t2 = st.columns(2)
     with t1:
         adv_burn_sub = st.toggle("Ghi phụ đề chữ lên video", value=True)
@@ -1664,11 +1838,20 @@ if start_button:
                     st.stop()
                 st.write(f"✅ Nhận diện xong {len(segments)} câu.")
 
-                st.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
+                if _get_claude_api_key():
+                    st.write("🌐 Đang dịch sát nghĩa theo ngữ cảnh bằng Claude...")
+                else:
+                    st.write("🌐 Đang dịch sang tiếng Việt bằng Google Translate (theo batch)...")
                 translate_bar = st.progress(0, text="Đang dịch...")
                 segments = translate_segments(
                     segments, progress_cb=lambda d, t: translate_bar.progress(d / t, text=f"Đã dịch {d}/{t} câu")
                 )
+                if st.session_state.get("_translate_engine") == "claude":
+                    st.write("✨ Đã dịch bằng Claude theo ngữ cảnh.")
+                elif _get_claude_api_key():
+                    st.write("ℹ️ Claude không phản hồi được (kiểm tra API key / mạng) nên đã dùng Google Translate.")
+                else:
+                    st.write("ℹ️ Nhập Claude API key ở '⚙️ Tuỳ chỉnh nâng cao' để dịch sát nghĩa, tự nhiên hơn.")
 
                 srt_content = build_srt(segments, bilingual=bilingual)
                 with open(srt_path, "w", encoding="utf-8") as f:
