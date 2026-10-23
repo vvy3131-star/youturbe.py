@@ -1,23 +1,43 @@
 """
-Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ + VIRAL BOOST.
+Dịch & lồng tiếng video Trung → Việt — BẢN TỰ ĐỘNG HOÁ + VIRAL BOOST (bản sửa lỗi phụ đề / lồng tiếng + dịch sát nghĩa).
 
 Người dùng chỉ cần: tải video → chọn cỡ chữ → chọn màu chữ → chọn giọng đọc.
-Phần còn lại (phát hiện & làm mờ phụ đề gốc, lồng tiếng AI, hạ âm lượng gốc,
-màu viền tương phản, tốc độ xử lý...) được xử lý tự động.
 
-BẢN NÀY CÓ GÌ MỚI
-    - Sửa lỗi "open() got an unexpected keyword argument 'metadata_errors'":
-      app tự đọc file wav 16kHz rồi đưa thẳng mảng số cho faster-whisper, không
-      còn phụ thuộc vào hàm giải mã av.open() của thư viện PyAV nữa.
-    - Chữ trong giao diện đậm, to và tương phản cao (kể cả khi thiếu config.toml).
-    - 12 tính năng "Viral Boost": lật gương, zoom nhẹ, tăng màu & nét, tăng tốc nhẹ,
-      tiêu đề hook 3 giây đầu, watermark tên kênh, che logo góc, thanh tiến trình,
-      fade vào/ra, chuẩn hoá âm lượng, khung dọc 9:16 Shorts, thumbnail tự động,
-      gói YouTube (tiêu đề / mô tả / chương / hashtag).
+BẢN NÀY SỬA GÌ
+    PHỤ ĐỀ KHÔNG HIỆN
+    - Cỡ chữ trước đây bị libass nhân theo khung 288px nên chữ quá to, tràn khung hình. Giờ dùng
+      original_size + cỡ chữ tính theo pixel thật (khớp với ảnh xem trước).
+    - Tự chọn font có đủ dấu tiếng Việt (DejaVu / Liberation / Noto / Arial) và chỉ đường dẫn thư mục font.
+    - Nếu ffmpeg không có bộ lọc 'subtitles' (thiếu libass) hoặc lỗi → tự chuyển sang vẽ chữ bằng
+      'drawtext'; nếu vẫn lỗi thì vẫn xuất video và báo rõ lý do (không im lặng).
+
+    KHÔNG LỒNG TIẾNG
+    - Trước đây mọi lỗi edge-tts bị nuốt im lặng → video ra không có tiếng. Giờ: hiển thị lỗi thật,
+      tự chuyển sang gTTS (dự phòng) và báo lỗi rõ ràng nếu không tạo được giọng nào.
+    - Ghép track lồng tiếng bằng numpy (ổn định hơn amix hàng trăm đầu vào).
+    - Khớp thời lượng theo khoảng trống đến câu kế tiếp + tăng tốc tối đa 1.30x → ít bị trễ dần so với hình.
+    - Video gốc không có audio vẫn lồng tiếng được.
+
+    DỊCH SÁT NGHĨA HƠN
+    - Whisper: ép chữ Giản thể + dấu câu, lọc câu "ảo giác", mặc định model small + beam 5.
+    - Ghép các mẩu câu rời thành câu hoàn chỉnh trước khi dịch (có ngữ cảnh → dịch đúng hơn,
+      giọng đọc cũng tự nhiên hơn).
+    - Có 2 công cụ dịch: Google Dịch (miễn phí, chạy song song) hoặc Claude AI (dịch theo ngữ cảnh,
+      sát nghĩa nhất, cần API key — đặt ANTHROPIC_API_KEY trong biến môi trường / st.secrets,
+      hoặc nhập trong "Tuỳ chỉnh nâng cao").
+    - Từ điển tên riêng/thuật ngữ (mỗi dòng: 中文=Tiếng Việt) để giữ tên nhân vật nhất quán.
 
 CÀI ĐẶT:
-    pip install -r requirements.txt        # cần streamlit >= 1.50
-    # cần ffmpeg: sudo apt install ffmpeg / brew install ffmpeg
+    pip install -r requirements.txt
+    requirements.txt gợi ý:
+        streamlit>=1.50
+        faster-whisper
+        deep-translator
+        edge-tts>=7.0        # nhớ: pip install -U edge-tts  (bản cũ hay bị Microsoft chặn 403)
+        gTTS                 # dự phòng khi edge-tts lỗi
+        numpy
+        pillow
+    cần ffmpeg (có libass + freetype): sudo apt install ffmpeg fonts-dejavu-core / brew install ffmpeg
 
 CHẠY:
     streamlit run app.py
@@ -31,13 +51,20 @@ CẤU TRÚC THƯ MỤC:
 
 import asyncio
 import hashlib
+import html as html_lib
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
+import urllib.error
+import urllib.request
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import streamlit as st
@@ -220,10 +247,11 @@ st.html("""
 <div class="hero">
   <span class="badge">AI · Video Studio</span>
   <h1>Dịch & lồng tiếng video<br>Trung → Việt</h1>
-  <p>Tải video lên, chọn vài tuỳ chọn — phần còn lại AI lo: nhận diện giọng nói, dịch, che phụ đề gốc,
+  <p>Tải video lên, chọn vài tuỳ chọn — phần còn lại AI lo: nhận diện giọng nói, dịch sát nghĩa, che phụ đề gốc,
   ghi phụ đề mới, lồng tiếng Việt và tăng sức hút cho video.</p>
   <div class="chips">
     <span class="chip">🔎 Tự phát hiện phụ đề gốc</span>
+    <span class="chip">🌐 Dịch theo ngữ cảnh</span>
     <span class="chip">🎙️ Lồng tiếng AI</span>
     <span class="chip">🚀 Viral Boost</span>
     <span class="chip">🖼️ Thumbnail & mô tả YouTube</span>
@@ -247,10 +275,10 @@ POSITION_OPTIONS = {"Dưới (mặc định)": 2, "Giữa màn hình": 5, "Trên
 
 SPEED_PRESETS = {
     "⚡ Nhanh nhất": {"beam_size": 1, "video_preset": "ultrafast", "tts_concurrency": 12},
-    "⚖️ Cân bằng": {"beam_size": 3, "video_preset": "veryfast", "tts_concurrency": 6},
+    "⚖️ Cân bằng": {"beam_size": 5, "video_preset": "veryfast", "tts_concurrency": 6},
     "🎯 Chính xác nhất": {"beam_size": 5, "video_preset": "medium", "tts_concurrency": 4},
 }
-DEFAULT_SPEED_LABEL = "⚡ Nhanh nhất"
+DEFAULT_SPEED_LABEL = "⚖️ Cân bằng"
 DEFAULT_POSITION_LABEL = "Dưới (mặc định)"
 
 LOGO_CORNERS = {
@@ -261,6 +289,10 @@ LOGO_CORNERS = {
     "↘ Dưới phải": "br",
 }
 
+ENGINE_GOOGLE = "Google Dịch (miễn phí)"
+ENGINE_CLAUDE = "Claude AI (sát nghĩa nhất, cần API key)"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+
 CPU_COUNT = os.cpu_count() or 4
 
 SAMPLE_SUBTITLE_TEXT = "Đây là câu phụ đề mẫu để xem trước"
@@ -269,7 +301,9 @@ SAMPLE_TTS_TEXT = "Xin chào, đây là giọng đọc mẫu để bạn nghe th
 AUTO_BG_VOLUME_PCT = 8
 AUTO_NO_DUB_VOLUME_PCT = 100
 
-MAX_TTS_SPEEDUP = 1.15
+# Tăng tốc tối đa cho giọng đọc để khớp khung thời gian (1.30x vẫn nghe tự nhiên).
+MAX_TTS_SPEEDUP = 1.30
+TTS_SAMPLE_RATE = 24000
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -288,6 +322,16 @@ def find_font_path():
         if os.path.exists(c):
             return c
     return None
+
+
+def get_default_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            key = ""
+    return (key or "").strip()
 
 
 # ============================================================
@@ -355,61 +399,268 @@ def load_whisper_model(model_size: str):
 def load_wav_as_float32(path: str) -> "np.ndarray":
     """Đọc file wav 16kHz mono (do ffmpeg tạo) thành mảng float32 [-1, 1].
 
-    SỬA LỖI "open() got an unexpected keyword argument 'metadata_errors'":
-    lỗi này xảy ra vì faster-whisper gọi av.open(..., metadata_errors=...) khi đưa vào
-    đường dẫn file, mà bản PyAV cài trên máy quá cũ không có tham số đó. Ở đây ta đã có
-    sẵn wav chuẩn từ ffmpeg nên đọc trực tiếp và truyền mảng numpy — bỏ qua hoàn toàn PyAV.
+    Truyền thẳng mảng numpy cho faster-whisper để bỏ qua PyAV (tránh lỗi
+    "open() got an unexpected keyword argument 'metadata_errors'" trên bản PyAV cũ).
     """
     with wave.open(path, "rb") as wf:
         raw = wf.readframes(wf.getnframes())
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 3, progress_cb=None):
+# ============================================================
+# NHẬN DIỆN GIỌNG NÓI
+# ============================================================
+
+WHISPER_ZH_PROMPT = "以下是普通话的句子，使用简体中文和标点符号。"
+_HALLUCINATION_RE = re.compile(r"(请不吝|点赞|订阅|转发|打赏|字幕(志愿者|by|组)|Amara\.org|明镜|优优独播剧场)", re.I)
+_HAS_CONTENT_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+SENTENCE_END = tuple("。！？!?；;…”」』.")
+
+
+def transcribe_audio(audio_path: str, model_size: str, beam_size: int = 5, progress_cb=None):
     model = load_whisper_model(model_size)
     audio_array = load_wav_as_float32(audio_path)
-    segments, info = model.transcribe(audio_array, language="zh", vad_filter=True, beam_size=beam_size)
+    segments, info = model.transcribe(
+        audio_array, language="zh", task="transcribe",
+        vad_filter=True, vad_parameters={"min_silence_duration_ms": 400},
+        beam_size=beam_size, condition_on_previous_text=False,
+        initial_prompt=WHISPER_ZH_PROMPT,
+    )
     results = []
+    recent = []
     for seg in segments:
-        results.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+        text = seg.text.strip()
+        if not text or not _HAS_CONTENT_RE.search(text):
+            continue
+        no_speech = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
+        avg_lp = float(getattr(seg, "avg_logprob", 0.0) or 0.0)
+        comp = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
+        # Lọc "ảo giác" của Whisper trên đoạn im lặng / nhạc nền.
+        if no_speech > 0.8 and avg_lp < -1.0:
+            continue
+        if comp > 2.6:
+            continue
+        if len(text) <= 30 and _HALLUCINATION_RE.search(text):
+            continue
+        if text in recent[-2:]:
+            continue
+        recent.append(text)
+        results.append({"start": float(seg.start), "end": float(seg.end), "text": text})
         if progress_cb:
-            progress_cb(seg.end, seg.text.strip())
+            progress_cb(seg.end, text)
     return results
 
 
-def translate_segments(segments, progress_cb=None, chunk_size: int = 40):
+def merge_segments(segments, max_gap: float = 0.6, max_dur: float = 9.0, max_chars: int = 50):
+    """Ghép các mẩu câu bị cắt dở thành câu hoàn chỉnh (dịch có ngữ cảnh → sát nghĩa; lồng tiếng tự nhiên)."""
+    merged = []
+    for seg in segments:
+        seg = dict(seg)
+        if merged:
+            prev = merged[-1]
+            gap = seg["start"] - prev["end"]
+            incomplete = not prev["text"].rstrip().endswith(SENTENCE_END)
+            if (incomplete and gap <= max_gap
+                    and (seg["end"] - prev["start"]) <= max_dur
+                    and len(prev["text"]) + len(seg["text"]) <= max_chars):
+                a, b = prev["text"].rstrip(), seg["text"].lstrip()
+                sep = " " if (a[-1:].isascii() and a[-1:].isalnum() and b[:1].isascii() and b[:1].isalnum()) else ""
+                prev["text"] = a + sep + b
+                prev["end"] = seg["end"]
+                continue
+        merged.append(seg)
+    return merged
+
+
+# ============================================================
+# DỊCH THUẬT
+# ============================================================
+
+def parse_glossary(text: str):
+    """Mỗi dòng: 中文=Tiếng Việt  →  [(中文, Tiếng Việt), ...] (cụm dài xếp trước)."""
+    pairs = []
+    for line in (text or "").splitlines():
+        if "=" in line:
+            zh, vi = line.split("=", 1)
+            zh, vi = zh.strip(), vi.strip()
+            if zh and vi:
+                pairs.append((zh, vi))
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
+
+
+def _clean_vi(text: str) -> str:
+    t = html_lib.unescape(text or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _google_translate_one(text: str, glossary):
     from deep_translator import GoogleTranslator
+    src = text
+    for zh, vi in glossary:
+        src = src.replace(zh, vi)
     translator = GoogleTranslator(source="zh-CN", target="vi")
-
-    texts = [seg["text"] for seg in segments]
-    translated_all = [None] * len(segments)
-
-    done = 0
-    for start in range(0, len(texts), chunk_size):
-        chunk = texts[start:start + chunk_size]
+    for attempt in range(3):
         try:
-            batch_result = translator.translate_batch(chunk)
+            r = translator.translate(src)
+            if r:
+                return _clean_vi(r)
         except Exception:
-            batch_result = None
+            time.sleep(0.6 * (attempt + 1))
+    return None
 
-        if batch_result and len(batch_result) == len(chunk):
-            for i, t in enumerate(batch_result):
-                translated_all[start + i] = t if t else chunk[i]
-        else:
-            for i, text in enumerate(chunk):
-                try:
-                    translated_all[start + i] = translator.translate(text)
-                except Exception:
-                    translated_all[start + i] = text
 
-        done = min(start + chunk_size, len(texts))
+def translate_google(texts, glossary, progress_cb=None, workers: int = 6):
+    out = [None] * len(texts)
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_google_translate_one, t, glossary): i for i, t in enumerate(texts)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                out[i] = fut.result()
+            except Exception:
+                out[i] = None
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(texts))
+    return out
+
+
+CLAUDE_SYSTEM_PROMPT = (
+    "You are a professional Chinese-to-Vietnamese subtitle translator and dubbing script writer. "
+    "Translate each numbered line faithfully and precisely: keep the full meaning, tone, names, numbers and "
+    "idioms (translate idioms by meaning). Use natural, fluent spoken Vietnamese that a voice actor can read aloud. "
+    "Do not summarise, omit, add commentary or censor. Keep each translation reasonably concise (similar spoken "
+    "length to the source) so it fits the timing. Keep proper names consistent with the glossary and with earlier "
+    "context. Lines may be fragments of a longer sentence: use the neighbouring lines to resolve ambiguity. "
+    "Output ONLY a JSON array of strings, one Vietnamese string per input line, in the same order and count."
+)
+
+
+def _claude_call(api_key: str, model: str, system: str, user: str, timeout: int = 120) -> str:
+    body = json.dumps({
+        "model": model, "max_tokens": 4096, "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+
+
+def _parse_json_array(text: str, expected: int):
+    s, e = text.find("["), text.rfind("]")
+    if s < 0 or e <= s:
+        return None
+    try:
+        arr = json.loads(text[s:e + 1])
+    except Exception:
+        return None
+    if not isinstance(arr, list) or len(arr) != expected or not all(isinstance(x, str) for x in arr):
+        return None
+    return [_clean_vi(x) for x in arr]
+
+
+def translate_claude(texts, api_key: str, model: str, glossary, progress_cb=None, batch_size: int = 15):
+    """Dịch theo lô kèm ngữ cảnh (các câu đã dịch trước đó). Câu lỗi trả về None để dự phòng bằng Google."""
+    out = [None] * len(texts)
+    errors = []
+    gloss_txt = "\n".join(f"{zh} = {vi}" for zh, vi in glossary)
+    done = 0
+    for start in range(0, len(texts), batch_size):
+        chunk = texts[start:start + batch_size]
+        ctx_lines = []
+        for j in range(max(0, start - 4), start):
+            if out[j]:
+                ctx_lines.append(f"{texts[j]} => {out[j]}")
+        user = ""
+        if gloss_txt:
+            user += f"Glossary (must follow):\n{gloss_txt}\n\n"
+        if ctx_lines:
+            user += "Previous lines (context only, already translated, do NOT translate again):\n" + "\n".join(ctx_lines) + "\n\n"
+        nxt = texts[start + len(chunk):start + len(chunk) + 2]
+        if nxt:
+            user += "Next lines (context only, do NOT translate):\n" + "\n".join(nxt) + "\n\n"
+        user += f"Translate these {len(chunk)} lines. Return ONLY a JSON array of {len(chunk)} strings.\n"
+        user += "\n".join(f"{i + 1}. {t}" for i, t in enumerate(chunk))
+
+        result = None
+        for attempt in range(2):
+            try:
+                reply = _claude_call(api_key, model, CLAUDE_SYSTEM_PROMPT, user)
+                result = _parse_json_array(reply, len(chunk))
+                if result:
+                    break
+            except Exception as e:
+                errors.append(str(e))
+                if "HTTP 401" in str(e) or "HTTP 403" in str(e) or "HTTP 404" in str(e):
+                    break  # sai key / model → không thử lại
+                time.sleep(1.5)
+        if result:
+            for i, t in enumerate(result):
+                out[start + i] = t or None
+        done = min(start + batch_size, len(texts))
         if progress_cb:
             progress_cb(done, len(texts))
+        if errors and ("HTTP 401" in errors[-1] or "HTTP 403" in errors[-1] or "HTTP 404" in errors[-1]):
+            break
+    return out, errors
 
-    for seg, translated in zip(segments, translated_all):
-        seg["translated"] = translated if translated else seg["text"]
-    return segments
 
+def translate_segments(segments, engine: str = "google", api_key: str = "", model: str = DEFAULT_CLAUDE_MODEL,
+                       glossary_text: str = "", progress_cb=None):
+    """Trả về (segments, warnings, engine_used)."""
+    glossary = parse_glossary(glossary_text)
+    texts = [seg["text"] for seg in segments]
+    translated = [None] * len(texts)
+    warnings = []
+    engine_used = "Google Dịch"
+
+    if engine == "claude" and api_key:
+        translated, errs = translate_claude(texts, api_key, model or DEFAULT_CLAUDE_MODEL, glossary, progress_cb)
+        engine_used = f"Claude ({model or DEFAULT_CLAUDE_MODEL})"
+        if errs:
+            warnings.append("Claude API báo lỗi: " + errs[-1][:250])
+        missing = [i for i, t in enumerate(translated) if not t]
+        if missing:
+            warnings.append(f"{len(missing)} câu Claude chưa dịch được → dịch bù bằng Google Dịch.")
+            engine_used += " + Google bổ sung"
+            g = translate_google([texts[i] for i in missing], glossary)
+            for i, t in zip(missing, g):
+                translated[i] = t
+    else:
+        if engine == "claude" and not api_key:
+            warnings.append("Chưa có API key Claude → dùng Google Dịch.")
+        translated = translate_google(texts, glossary, progress_cb)
+
+    failed = 0
+    for seg, t in zip(segments, translated):
+        if t:
+            seg["translated"] = t
+        else:
+            seg["translated"] = seg["text"]
+            failed += 1
+    if failed:
+        warnings.append(f"{failed} câu không dịch được (giữ nguyên tiếng Trung) — kiểm tra kết nối mạng.")
+    return segments, warnings, engine_used
+
+
+# ============================================================
+# PHỤ ĐỀ (SRT) VÀ MÀU
+# ============================================================
 
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -475,72 +726,166 @@ def compute_logo_box(width: int, height: int, corner: str):
     return cx, cy, bw, bh
 
 
+def _ff_escape_path(p: str) -> str:
+    return p.replace("\\", "/").replace(":", "\\:")
+
+
+def _ass_font_info():
+    """(FontName, Bold, tùy chọn fontsdir) — chọn font có đủ dấu tiếng Việt."""
+    fp = find_font_path()
+    if not fp:
+        return "Arial", 1, ""
+    base = os.path.basename(fp).lower()
+    if "dejavu" in base:
+        name = "DejaVu Sans"
+    elif "liberation" in base:
+        name = "Liberation Sans"
+    elif "noto" in base:
+        name = "Noto Sans"
+    else:
+        name = "Arial"
+    bold = 1 if ("bold" in base or base.endswith("bd.ttf")) else 0
+    return name, bold, f":fontsdir={_ff_escape_path(os.path.dirname(fp))}"
+
+
 def process_video(video_path: str, output_path: str, *,
                    remove_old_sub: bool = False, old_sub_method: str = "blur",
                    old_sub_box=None, old_sub_color: str = "0x000000", blur_strength: int = 25,
-                   burn_new_sub: bool = False, srt_path: str = None,
-                   font_size: int = 20, primary_color: str = "&H00FFFFFF&",
-                   outline_color: str = "&H00000000&", alignment: int = 2, margin_v: int = 25,
+                   burn_new_sub: bool = False, srt_path: str = None, segments=None,
+                   font_size: int = 16, text_color_hex: str = "#FFFFFF", outline_color_hex: str = "#000000",
+                   alignment: int = 2, margin_v: int = 25,
                    video_preset: str = "veryfast", hflip: bool = False, frame_width: int = None):
-    """Gộp lật gương + xóa phụ đề gốc + ghi phụ đề mới vào MỘT lần encode video duy nhất."""
-    filters = []
-    stage = "[0:v]"
-    counter = 0
+    """Gộp lật gương + xóa phụ đề gốc + ghi phụ đề mới vào MỘT lần encode.
 
-    if hflip:
-        # Lật gương trước; toạ độ vùng che phụ đề gốc được lật theo để vẫn trùng đúng chỗ,
-        # còn phụ đề mới ghi SAU bước này nên không bị ngược chữ.
-        filters.append(f"{stage}hflip[vflip{counter}]")
-        stage = f"[vflip{counter}]"
-        if old_sub_box and frame_width:
-            bx, by, bw, bh = old_sub_box
-            old_sub_box = (frame_width - bx - bw, by, bw, bh)
+    font_size tính trên khung cao 360px rồi nhân theo độ phân giải thật (khớp ảnh xem trước);
+    margin_v tính bằng pixel thật. Trả về danh sách ghi chú để hiển thị cho người dùng.
+    """
+    notes = []
+    res = get_video_resolution(video_path)
+    W = res[0] if res else frame_width
+    H = res[1] if res else None
+    want_sub = bool(burn_new_sub and srt_path)
+    if want_sub and (W is None or H is None):
+        raise FFmpegError("Không đọc được độ phân giải video nên không thể ghi phụ đề.")
+    font_px = max(int(round(font_size * (H / 360))), 12) if H else 0
+    work_dir = os.path.dirname(output_path) or "."
 
-    if remove_old_sub and old_sub_box:
-        x, y, w, h = old_sub_box
-        if old_sub_method == "blur":
-            luma_radius = max(1, min(int(blur_strength), 40))
-            chroma_radius = max(1, min(luma_radius, 17))
-            filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
-            filters.append(
-                f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
-                f"boxblur=luma_radius={luma_radius}:luma_power=2:"
-                f"chroma_radius={chroma_radius}:chroma_power=2[vblur{counter}]"
+    def _encode(sub_mode: str):
+        filters = []
+        stage = "[0:v]"
+        counter = 0
+        box = old_sub_box
+
+        if hflip:
+            # Lật gương trước; vùng che phụ đề gốc lật theo, còn phụ đề mới ghi SAU nên không bị ngược chữ.
+            filters.append(f"{stage}hflip[vflip{counter}]")
+            stage = f"[vflip{counter}]"
+            if box and (W or frame_width):
+                bx, by, bw, bh = box
+                box = ((W or frame_width) - bx - bw, by, bw, bh)
+
+        if remove_old_sub and box:
+            x, y, w, h = box
+            if old_sub_method == "blur":
+                luma_radius = max(1, min(int(blur_strength), 40))
+                chroma_radius = max(1, min(luma_radius, 17))
+                filters.append(f"{stage}split=2[vmain{counter}][vcrop{counter}]")
+                filters.append(
+                    f"[vcrop{counter}]crop={w}:{h}:{x}:{y},"
+                    f"boxblur=luma_radius={luma_radius}:luma_power=2:"
+                    f"chroma_radius={chroma_radius}:chroma_power=2[vblur{counter}]"
+                )
+                filters.append(f"[vmain{counter}][vblur{counter}]overlay={x}:{y}[v{counter}]")
+            elif old_sub_method == "delogo":
+                filters.append(f"{stage}delogo=x={x}:y={y}:w={w}:h={h}:show=0[v{counter}]")
+            else:  # solid
+                filters.append(f"{stage}drawbox=x={x}:y={y}:w={w}:h={h}:color={old_sub_color}@1:t=fill[v{counter}]")
+            stage = f"[v{counter}]"
+            counter += 1
+
+        if want_sub and sub_mode == "ass":
+            font_name, bold, fontsdir_opt = _ass_font_info()
+            outline = max(round(font_px / 14, 1), 1.5)
+            style = (
+                f"FontName={font_name},FontSize={font_px},Bold={bold},"
+                f"PrimaryColour={hex_to_ass_color(text_color_hex)},"
+                f"OutlineColour={hex_to_ass_color(outline_color_hex)},"
+                f"BorderStyle=1,Outline={outline},Shadow=0.6,"
+                f"Alignment={alignment},MarginV={int(margin_v)},"
+                f"MarginL={int(W * 0.05)},MarginR={int(W * 0.05)}"
             )
-            filters.append(f"[vmain{counter}][vblur{counter}]overlay={x}:{y}[v{counter}]")
-        elif old_sub_method == "delogo":
-            filters.append(f"{stage}delogo=x={x}:y={y}:w={w}:h={h}:show=0[v{counter}]")
-        else:  # solid
-            filters.append(f"{stage}drawbox=x={x}:y={y}:w={w}:h={h}:color={old_sub_color}@1:t=fill[v{counter}]")
-        stage = f"[v{counter}]"
-        counter += 1
+            filters.append(
+                f"{stage}subtitles={_ff_escape_path(srt_path)}:original_size={W}x{H}"
+                f"{fontsdir_opt}:force_style='{style}'[vsub]"
+            )
+            stage = "[vsub]"
+        elif want_sub and sub_mode == "drawtext":
+            font = find_font_path()
+            if not font or not segments:
+                raise FFmpegError("Không có font hoặc dữ liệu câu để vẽ phụ đề dự phòng.")
+            ff = _ff_escape_path(font)
+            chars_per_line = max(int(W * 0.9 / (font_px * 0.52)), 10)
+            if alignment == 8:
+                y_expr = f"{int(margin_v)}"
+            elif alignment == 5:
+                y_expr = "(h-text_h)/2"
+            else:
+                y_expr = f"h-text_h-{int(margin_v)}"
+            border = max(int(font_px / 12), 2)
+            parts = []
+            for i, seg in enumerate(segments):
+                text = (seg.get("translated") or "").strip()
+                if not text:
+                    continue
+                tp = os.path.join(work_dir, f"sub_{i}.txt")
+                with open(tp, "w", encoding="utf-8") as f:
+                    f.write("\n".join(textwrap.wrap(text, width=chars_per_line)))
+                parts.append(
+                    f"drawtext=fontfile='{ff}':textfile='{_ff_escape_path(tp)}':expansion=none:"
+                    f"fontcolor={hex_to_ffmpeg_color(text_color_hex)}:fontsize={font_px}:"
+                    f"borderw={border}:bordercolor={hex_to_ffmpeg_color(outline_color_hex)}:"
+                    f"line_spacing=6:x=(w-text_w)/2:y={y_expr}:"
+                    f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'"
+                )
+            if parts:
+                filters.append(f"{stage}" + ",".join(parts) + "[vsub]")
+                stage = "[vsub]"
 
-    if burn_new_sub and srt_path:
-        srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
-        style = (
-            f"FontName=Arial,FontSize={font_size},PrimaryColour={primary_color},"
-            f"OutlineColour={outline_color},BorderStyle=1,Outline=1.2,Shadow=0.5,"
-            f"Alignment={alignment},MarginV={margin_v}"
-        )
-        filters.append(f"{stage}subtitles={srt_escaped}:force_style='{style}'[vout]")
-        stage = "[vout]"
+        # libx264 yêu cầu chiều rộng/cao là số chẵn.
+        filters.append(f"{stage}scale=trunc(iw/2)*2:trunc(ih/2)*2[veven]")
+        stage = "[veven]"
 
-    # libx264 yêu cầu chiều rộng/cao là số chẵn.
-    filters.append(f"{stage}scale=trunc(iw/2)*2:trunc(ih/2)*2[veven]")
-    stage = "[veven]"
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-filter_complex", ";".join(filters),
+            "-map", stage, "-map", "0:a?",
+            "-c:v", "libx264", "-preset", video_preset, "-crf", "20",
+            "-pix_fmt", "yuv420p", "-threads", "0",
+            "-c:a", "copy",
+            output_path,
+        ]
+        _run_ffmpeg(cmd, label="xử lý hình ảnh video (lật gương / xoá phụ đề gốc / ghi phụ đề mới)")
 
-    filter_complex = ";".join(filters)
+    if not want_sub:
+        _encode("none")
+        return notes
 
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-filter_complex", filter_complex,
-        "-map", stage, "-map", "0:a?",
-        "-c:v", "libx264", "-preset", video_preset, "-crf", "20",
-        "-threads", "0",
-        "-c:a", "copy",
-        output_path,
-    ]
-    _run_ffmpeg(cmd, label="xử lý hình ảnh video (lật gương / xoá phụ đề gốc / ghi phụ đề mới)")
+    try:
+        _encode("ass")
+    except FFmpegError as e_ass:
+        first = str(e_ass).splitlines()[-1][:200] if str(e_ass) else ""
+        notes.append(f"Bộ lọc 'subtitles' của ffmpeg lỗi ({first}) → đã chuyển sang cách vẽ chữ dự phòng.")
+        try:
+            _encode("drawtext")
+        except FFmpegError as e_dt:
+            second = str(e_dt).splitlines()[-1][:200] if str(e_dt) else ""
+            notes.append(
+                f"Cách vẽ chữ dự phòng cũng lỗi ({second}). Video được xuất KHÔNG kèm phụ đề cứng — "
+                "hãy cài ffmpeg đầy đủ (libass, freetype) và font: sudo apt install ffmpeg fonts-dejavu-core. "
+                "File .srt vẫn tải được ở phần kết quả."
+            )
+            _encode("none")
+    return notes
 
 
 def adjust_video_volume(video_path: str, output_path: str, volume_factor: float):
@@ -556,10 +901,6 @@ def adjust_video_volume(video_path: str, output_path: str, volume_factor: float)
 # ============================================================
 # VIRAL BOOST — lượt xử lý hoàn thiện cuối (1 lần encode)
 # ============================================================
-
-def _ff_escape_path(p: str) -> str:
-    return p.replace("\\", "/").replace(":", "\\:")
-
 
 def finish_video(in_path: str, out_path: str, tmp_dir: str, *, speed: float = 1.0, zoom_pct: int = 0,
                   color_boost: bool = False, logo_corner=None, vertical: bool = False,
@@ -1091,26 +1432,26 @@ def _load_preview_font(size: int):
 def render_subtitle_style_preview(base_image: "Image.Image", sample_text: str, font_size: int,
                                    text_color_hex: str, outline_color_hex: str,
                                    alignment: int, margin_v: int) -> "Image.Image":
+    """font_size tính trên khung cao 360px (nhân theo độ phân giải), margin_v là pixel thật — khớp với video xuất ra."""
     img = base_image.copy()
     w, h = img.size
     draw = ImageDraw.Draw(img)
 
-    scaled_font_size = max(int(font_size * (h / 360)), 10)
+    scaled_font_size = max(int(round(font_size * (h / 360))), 12)
     font = _load_preview_font(scaled_font_size)
 
     bbox = draw.textbbox((0, 0), sample_text, font=font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
     x = (w - text_w) / 2
-    scaled_margin = int(margin_v * (h / 360))
     if alignment == 8:
-        y = scaled_margin
+        y = margin_v
     elif alignment == 5:
         y = (h - text_h) / 2
     else:
-        y = h - text_h - scaled_margin - h * 0.02
+        y = h - text_h - margin_v
 
-    outline_w = max(scaled_font_size // 12, 1)
+    outline_w = max(scaled_font_size // 14, 1)
     draw.text((x, y), sample_text, font=font, fill=text_color_hex,
               stroke_width=outline_w, stroke_fill=outline_color_hex)
     return img
@@ -1170,163 +1511,227 @@ def render_text_overlays_preview(img: "Image.Image", hook_text: str, watermark_t
     return img
 
 
-def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, out_path: str,
-                                sample_text: str = SAMPLE_TTS_TEXT):
-    import edge_tts
-    communicate = edge_tts.Communicate(sample_text, voice=voice, rate=rate, volume=volume, pitch=pitch)
-    _run_async(communicate.save(out_path))
-
-
 # ============================================================
 # LỒNG TIẾNG (TTS)
 # ============================================================
 
-def _run_async(coro):
+def _run_async(coro_factory):
+    """Chạy coroutine do coro_factory() tạo ra. Dùng asyncio.run; nếu đã có loop đang chạy thì chạy trong thread riêng."""
     try:
-        asyncio.run(coro)
+        asyncio.get_running_loop()
     except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    box = {}
+
+    def runner():
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(coro)
+            asyncio.set_event_loop(loop)
+            box["value"] = loop.run_until_complete(coro_factory())
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
         finally:
             loop.close()
+
+    th = threading.Thread(target=runner)
+    th.start()
+    th.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def generate_tts_preview_audio(voice: str, rate: str, volume: str, pitch: str, out_path: str,
+                                sample_text: str = SAMPLE_TTS_TEXT):
+    import edge_tts
+    try:
+        communicate = edge_tts.Communicate(sample_text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+        _run_async(lambda: communicate.save(out_path))
+    except Exception as e_edge:
+        try:
+            _gtts_save(sample_text, out_path)
+        except Exception as e_gtts:
+            raise RuntimeError(
+                f"edge-tts lỗi: {e_edge}. gTTS dự phòng cũng lỗi: {e_gtts}. "
+                "Thử: pip install -U edge-tts gTTS và kiểm tra kết nối mạng."
+            )
+
+
+def prepare_tts_text(text: str) -> str:
+    """Làm sạch câu trước khi đọc: bỏ ký tự lạ, đọc được % và &."""
+    t = html_lib.unescape(text or "")
+    t = re.sub(r"[\[\]{}<>*_#~^|\\]", " ", t)
+    t = t.replace("&", " và ").replace("%", " phần trăm")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _gtts_save(text: str, path: str):
+    from gtts import gTTS
+    gTTS(text=text, lang="vi").save(path)
 
 
 def synthesize_all_tts(items, voice: str, rate: str, volume: str, pitch: str,
                         max_retries: int = 3, concurrency: int = 6, progress_cb=None):
+    """Trả về (failed_indices, errors, engine_counts). Không còn nuốt lỗi im lặng."""
     import edge_tts
 
     failed_indices = set()
-    done_count = 0
-    lock = asyncio.Lock()
+    errors = {}
+    engine_counts = {"edge": 0, "gtts": 0}
+    state = {"done": 0, "edge_ok": 0, "edge_fail_streak": 0}
 
     async def _synthesize_one(sem, idx, text, raw_path):
-        nonlocal done_count
         async with sem:
             success = False
-            for attempt in range(max_retries):
+            # 1) edge-tts (giọng chất lượng cao, có chọn giọng/tốc độ)
+            if not (state["edge_ok"] == 0 and state["edge_fail_streak"] >= 3):
+                for attempt in range(max_retries):
+                    try:
+                        communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+                        await communicate.save(raw_path)
+                        if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                            success = True
+                            engine_counts["edge"] += 1
+                            state["edge_ok"] += 1
+                            state["edge_fail_streak"] = 0
+                            break
+                    except Exception as e:  # noqa: BLE001
+                        errors[idx] = f"edge-tts: {type(e).__name__}: {e}"
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                if not success:
+                    state["edge_fail_streak"] += 1
+            # 2) gTTS dự phòng
+            if not success:
                 try:
-                    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
-                    await communicate.save(raw_path)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, _gtts_save, text, raw_path)
                     if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
                         success = True
-                        break
-                except Exception:
-                    await asyncio.sleep(0.6)
+                        engine_counts["gtts"] += 1
+                except Exception as e:  # noqa: BLE001
+                    errors[idx] = errors.get(idx, "") + f" | gTTS: {type(e).__name__}: {e}"
             if not success:
                 failed_indices.add(idx)
-        async with lock:
-            done_count += 1
-            if progress_cb:
-                progress_cb(done_count, len(items))
+        state["done"] += 1
+        if progress_cb:
+            progress_cb(state["done"], len(items))
 
     async def _synthesize_all():
         sem = asyncio.Semaphore(concurrency)
         await asyncio.gather(*[_synthesize_one(sem, idx, text, raw_path) for idx, text, raw_path in items])
 
-    _run_async(_synthesize_all())
-    return failed_indices
+    _run_async(_synthesize_all)
+    return failed_indices, errors, engine_counts
 
 
 def fit_audio_to_duration(in_path: str, out_path: str, target_duration: float):
-    """Khớp audio TTS vào khung thời gian của câu, tăng tốc tối đa MAX_TTS_SPEEDUP lần
-    để giọng đọc luôn tự nhiên; phần tràn được xử lý ở build_dub_track() (không chồng tiếng)."""
+    """Chuyển audio TTS về wav 24kHz mono, tăng tốc tối đa MAX_TTS_SPEEDUP nếu dài hơn khung thời gian."""
     dur = ffprobe_duration(in_path)
-    if dur <= target_duration or target_duration <= 0:
-        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-
-    factor = dur / target_duration
-    factor = min(factor, MAX_TTS_SPEEDUP)
-
-    if factor <= 1.02:
-        subprocess.run(["ffmpeg", "-y", "-i", in_path, "-ar", "24000", "-ac", "1", out_path],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-
-    subprocess.run(["ffmpeg", "-y", "-i", in_path, "-filter:a", f"atempo={factor:.3f}", "-ar", "24000", "-ac", "1", out_path],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = ["ffmpeg", "-y", "-i", in_path]
+    if dur > target_duration > 0:
+        factor = min(dur / target_duration, MAX_TTS_SPEEDUP)
+        if factor > 1.02:
+            cmd += ["-filter:a", f"atempo={factor:.3f}"]
+    cmd += ["-ar", str(TTS_SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", out_path]
+    _run_ffmpeg(cmd, label="khớp giọng đọc vào khung thời gian")
 
 
-def make_silence(out_path: str, duration: float):
-    duration = max(duration, 0.1)
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={duration}", out_path],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+def _read_wav_samples(path: str) -> "np.ndarray":
+    with wave.open(path, "rb") as wf:
+        raw = wf.readframes(wf.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32)
 
 
 def build_dub_track(segments, voice: str, rate: str, volume: str, pitch: str,
                      tmp_dir: str, total_duration: float, concurrency: int = 6, progress_cb=None):
+    """Tạo track lồng tiếng. Trả về (đường dẫn wav, tập chỉ số câu lỗi, mô tả engine / lỗi)."""
     items = []
     for i, seg in enumerate(segments):
-        text = seg["translated"].strip()
-        if text:
+        text = prepare_tts_text(seg["translated"])
+        if text and re.search(r"\w", text):
             raw_path = os.path.join(tmp_dir, f"tts_raw_{i}.mp3")
             items.append((i, text, raw_path))
 
-    failed_indices = synthesize_all_tts(items, voice, rate, volume, pitch,
-                                         concurrency=concurrency, progress_cb=progress_cb)
+    if not items:
+        raise RuntimeError("Không có câu nào để đọc (bản dịch trống).")
 
-    # Chống chồng tiếng: câu sau không bao giờ bắt đầu sớm hơn thời điểm câu trước kết thúc ("cursor").
-    seg_files = []
+    failed_indices, errors, engine_counts = synthesize_all_tts(
+        items, voice, rate, volume, pitch, concurrency=concurrency, progress_cb=progress_cb)
+
+    if len(failed_indices) == len(items):
+        sample_err = next(iter(errors.values()), "không rõ lỗi")
+        raise RuntimeError(
+            "Không tạo được giọng đọc cho bất kỳ câu nào, nên video sẽ không có tiếng lồng.\n"
+            f"Lỗi mẫu: {sample_err}\n"
+            "Cách khắc phục: (1) pip install -U edge-tts gTTS rồi chạy lại app; "
+            "(2) kiểm tra máy chủ có ra được Internet; (3) thử lại sau ít phút."
+        )
+
+    # Chống chồng tiếng: câu sau không bắt đầu sớm hơn lúc câu trước đọc xong ("cursor").
+    # Khung thời gian của mỗi câu kéo dài đến lúc câu kế tiếp bắt đầu → ít phải tăng tốc, ít bị trễ dần.
+    placed = []
     cursor = 0.0
-    for idx, text, raw_path in items:
+    item_by_idx = {idx: raw for idx, _, raw in items}
+    order = [idx for idx, _, _ in items]
+    for pos, idx in enumerate(order):
         seg = segments[idx]
-        slot_duration = max(seg["end"] - seg["start"], 0.3)
-        fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
-
         if idx in failed_indices:
-            make_silence(fit_path, slot_duration)
-            actual_dur = slot_duration
-        else:
-            fit_audio_to_duration(raw_path, fit_path, slot_duration)
-            try:
-                actual_dur = ffprobe_duration(fit_path)
-            except Exception:
-                actual_dur = slot_duration
-
+            continue
         actual_start = max(seg["start"], cursor)
-        cursor = actual_start + actual_dur
+        if pos + 1 < len(order):
+            next_start = segments[order[pos + 1]]["start"]
+        else:
+            next_start = max(total_duration, seg["end"])
+        slot_end = max(seg["end"], next_start - 0.08)
+        slot_duration = max(slot_end - actual_start, 0.4)
 
-        seg_files.append((actual_start, fit_path))
+        fit_path = os.path.join(tmp_dir, f"tts_fit_{idx}.wav")
+        fit_audio_to_duration(item_by_idx[idx], fit_path, slot_duration)
+        samples = _read_wav_samples(fit_path)
+        placed.append((actual_start, samples))
+        cursor = actual_start + len(samples) / TTS_SAMPLE_RATE + 0.05
 
-    dub_track_duration = max(total_duration, cursor)
+    dub_track_duration = max(total_duration, cursor) + 0.5
+    total_samples = int(dub_track_duration * TTS_SAMPLE_RATE)
+    mix = np.zeros(total_samples, dtype=np.float32)
+    for start, samples in placed:
+        s0 = int(start * TTS_SAMPLE_RATE)
+        s1 = min(s0 + len(samples), total_samples)
+        if s1 > s0:
+            mix[s0:s1] += samples[:s1 - s0]
+    mix = np.clip(mix, -32768, 32767).astype(np.int16)
 
     dub_track_path = os.path.join(tmp_dir, "dub_track.wav")
-    inputs = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={dub_track_duration}"]
-    filter_parts = []
-    amix_labels = ["[0:a]"]
-    for idx, (start, path) in enumerate(seg_files):
-        inputs += ["-i", path]
-        delay_ms = int(start * 1000)
-        filter_parts.append(f"[{idx + 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
-        amix_labels.append(f"[a{idx}]")
+    with wave.open(dub_track_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(TTS_SAMPLE_RATE)
+        wf.writeframes(mix.tobytes())
 
-    filter_complex = ";".join(filter_parts)
-    if filter_complex:
-        filter_complex += ";"
-    filter_complex += "".join(amix_labels) + f"amix=inputs={len(amix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
-
-    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_complex, "-map", "[aout]", dub_track_path]
-    _run_ffmpeg(cmd, label="ghép các đoạn giọng đọc AI thành 1 track")
-    return dub_track_path, failed_indices
+    info = f"edge-tts: {engine_counts['edge']} câu, gTTS dự phòng: {engine_counts['gtts']} câu"
+    if errors and failed_indices:
+        info += f" | lỗi mẫu: {next(iter(errors.values()))[:200]}"
+    return dub_track_path, failed_indices, info
 
 
 def combine_video_with_dub(video_path: str, dub_track_path: str, output_path: str,
                             keep_bg: bool, bg_volume: float = 0.08):
-    if keep_bg:
+    if keep_bg and has_audio_stream(video_path):
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
-            "-filter_complex", f"[0:a]volume={bg_volume}[bg];[1:a]anull[dub];[bg][dub]amix=inputs=2:duration=first:normalize=0[aout]",
-            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-shortest", output_path,
+            "-filter_complex",
+            f"[0:a]volume={bg_volume}[bg];[1:a]aresample=48000[dub];[bg]aresample=48000[bg2];"
+            f"[bg2][dub]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest", output_path,
         ]
     else:
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", dub_track_path,
-            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-shortest", output_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest", output_path,
         ]
     _run_ffmpeg(cmd, label="ghép giọng lồng tiếng AI vào video")
 
@@ -1402,17 +1807,16 @@ with st.container(key="card_upload"):
 
 pw, ph = preview_video_res if preview_video_res else (None, None)
 
-default_font_size = 20
-if ph:
-    default_font_size = max(14, min(48, int(ph / 18)))
-
 # ---------- BƯỚC 2: 3 LỰA CHỌN ----------
 with st.container(key="card_style"):
     step_header(2, "Chọn phong cách", "Chỉ 3 điều cần chọn — mọi thứ còn lại đã tự động tối ưu")
 
     c1, c2 = st.columns([3, 2])
     with c1:
-        font_size = st.slider("🔤 Cỡ chữ phụ đề", 10, 60, default_font_size, step=1)
+        font_size = st.slider(
+            "🔤 Cỡ chữ phụ đề", 8, 40, 16, step=1,
+            help="Tính theo khung cao 360px và tự nhân theo độ phân giải thật của video. 14–18 là vừa mắt.",
+        )
     with c2:
         text_color = st.color_picker("🎨 Màu chữ phụ đề", "#FFFFFF")
 
@@ -1473,9 +1877,35 @@ with st.container(key="card_viral"):
             'video qua được kiểm tra bản quyền.</div>')
 
 # ---------- TUỲ CHỈNH NÂNG CAO ----------
+default_api_key = get_default_api_key()
+
 with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
     st.caption("Chỉ mở phần này nếu bạn muốn tự tay ghi đè các lựa chọn tự động.")
 
+    st.markdown("**🌐 Dịch thuật (quan trọng nhất cho độ sát nghĩa)**")
+    adv_engine_label = st.segmented_control(
+        "Công cụ dịch", [ENGINE_GOOGLE, ENGINE_CLAUDE],
+        default=ENGINE_CLAUDE if default_api_key else ENGINE_GOOGLE, selection_mode="single",
+    ) or (ENGINE_CLAUDE if default_api_key else ENGINE_GOOGLE)
+    if adv_engine_label == ENGINE_CLAUDE:
+        adv_api_key = st.text_input(
+            "Anthropic API key", value="", type="password",
+            placeholder="Để trống = dùng ANTHROPIC_API_KEY trong biến môi trường / st.secrets",
+        )
+        adv_claude_model = st.text_input("Model Claude", value=DEFAULT_CLAUDE_MODEL)
+    else:
+        adv_api_key, adv_claude_model = "", DEFAULT_CLAUDE_MODEL
+    adv_merge = st.toggle(
+        "Ghép các mẩu câu rời thành câu hoàn chỉnh trước khi dịch", value=True,
+        help="Dịch có ngữ cảnh nên sát nghĩa hơn và giọng đọc ngắt nghỉ tự nhiên hơn.",
+    )
+    adv_glossary = st.text_area(
+        "Từ điển tên riêng / thuật ngữ (mỗi dòng: 中文=Tiếng Việt)", value="", height=100,
+        placeholder="张伟=Trương Vĩ\n北京=Bắc Kinh",
+        help="Giúp tên nhân vật, địa danh được dịch nhất quán.",
+    )
+
+    st.divider()
     t1, t2 = st.columns(2)
     with t1:
         adv_burn_sub = st.toggle("Ghi phụ đề chữ lên video", value=True)
@@ -1486,7 +1916,7 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
         "Vị trí phụ đề mới", list(POSITION_OPTIONS.keys()), default=DEFAULT_POSITION_LABEL,
         selection_mode="single",
     ) or DEFAULT_POSITION_LABEL
-    adv_margin_v = st.slider("Cách mép (px)", 0, 150, int(25 * ((ph or 360) / 360)), step=5)
+    adv_margin_v = st.slider("Cách mép (px thật của video)", 0, 300, int(25 * ((ph or 360) / 360)), step=5)
 
     st.divider()
     adv_manual_old_box = st.toggle("Tự chỉnh tay vùng che phụ đề gốc (thay vì tự động phát hiện)", value=False)
@@ -1523,7 +1953,10 @@ with st.expander("⚙️ Tuỳ chỉnh nâng cao (không bắt buộc)"):
                                    disabled=not adv_override_bg_volume)
 
     st.divider()
-    adv_model_size = st.selectbox("Model nhận diện giọng nói", ["tiny", "base", "small", "medium", "large-v3"], index=1)
+    adv_model_size = st.selectbox(
+        "Model nhận diện giọng nói (càng lớn càng chính xác nhưng chậm hơn)",
+        ["tiny", "base", "small", "medium", "large-v3"], index=2,
+    )
     adv_speed_label = st.segmented_control(
         "Tốc độ xử lý", list(SPEED_PRESETS.keys()), default=DEFAULT_SPEED_LABEL, selection_mode="single",
     ) or DEFAULT_SPEED_LABEL
@@ -1541,6 +1974,9 @@ remove_old_sub = not adv_disable_remove_old
 old_sub_method_key = adv_old_method_key
 box_color = adv_box_color
 blur_strength = adv_blur_strength
+
+translate_engine = "claude" if adv_engine_label == ENGINE_CLAUDE else "google"
+effective_api_key = (adv_api_key or "").strip() or default_api_key
 
 enable_dub = not adv_disable_dub
 keep_bg = adv_keep_bg
@@ -1645,6 +2081,9 @@ if start_button:
         thumb_bytes = None
         pack_text = None
         dub_warning_count = 0
+        dub_info = ""
+        translate_warnings = []
+        engine_used = ""
 
         try:
             with status:
@@ -1652,7 +2091,7 @@ if start_button:
                 extract_audio(input_path, audio_path)
                 total_duration = ffprobe_duration(input_path)
 
-                st.write("🗣️ Đang nhận diện giọng nói tiếng Trung...")
+                st.write(f"🗣️ Đang nhận diện giọng nói tiếng Trung (model {model_size})...")
                 transcribe_placeholder = st.empty()
                 segments = transcribe_audio(
                     audio_path, model_size, beam_size=speed_cfg["beam_size"],
@@ -1662,13 +2101,23 @@ if start_button:
                 if not segments:
                     status.update(label="Không nhận diện được giọng nói nào.", state="error")
                     st.stop()
-                st.write(f"✅ Nhận diện xong {len(segments)} câu.")
+                st.write(f"✅ Nhận diện xong {len(segments)} đoạn.")
 
-                st.write("🌐 Đang dịch sang tiếng Việt (theo batch)...")
+                if adv_merge:
+                    before = len(segments)
+                    segments = merge_segments(segments)
+                    st.write(f"🧩 Ghép thành {len(segments)} câu hoàn chỉnh (từ {before} đoạn) để dịch có ngữ cảnh.")
+
+                st.write("🌐 Đang dịch sang tiếng Việt...")
                 translate_bar = st.progress(0, text="Đang dịch...")
-                segments = translate_segments(
-                    segments, progress_cb=lambda d, t: translate_bar.progress(d / t, text=f"Đã dịch {d}/{t} câu")
+                segments, translate_warnings, engine_used = translate_segments(
+                    segments, engine=translate_engine, api_key=effective_api_key,
+                    model=adv_claude_model, glossary_text=adv_glossary,
+                    progress_cb=lambda d, t: translate_bar.progress(min(d / t, 1.0), text=f"Đã dịch {d}/{t} câu"),
                 )
+                st.write(f"✅ Dịch xong bằng: {engine_used}")
+                for w in translate_warnings:
+                    st.write(f"⚠️ {w}")
 
                 srt_content = build_srt(segments, bilingual=bilingual)
                 with open(srt_path, "w", encoding="utf-8") as f:
@@ -1681,7 +2130,7 @@ if start_button:
                     st.write("🎞️ Đang xử lý hình ảnh video (lật gương / xoá phụ đề gốc / ghi phụ đề mới)...")
                     resolution = get_video_resolution(current_video) or st.session_state.get("preview_video_res")
                     final_old_sub_box = None
-                    if (remove_old_sub or v_hflip) and resolution is None:
+                    if (remove_old_sub or v_hflip or burn_sub) and resolution is None:
                         raise FFmpegError(
                             "Không xác định được độ phân giải video để xử lý hình ảnh — "
                             "file có thể bị lỗi hoặc dùng codec không được hỗ trợ."
@@ -1702,20 +2151,20 @@ if start_button:
                                 final_old_sub_box = (bx, by, bw, bh)
 
                     processed_output = os.path.join(tmp_dir, "processed.mp4")
-                    process_video(
+                    sub_notes = process_video(
                         current_video, processed_output,
                         remove_old_sub=remove_old_sub, old_sub_method=old_sub_method_key,
                         old_sub_box=final_old_sub_box, old_sub_color=hex_to_ffmpeg_color(box_color),
                         blur_strength=blur_strength,
-                        burn_new_sub=burn_sub, srt_path=srt_path,
+                        burn_new_sub=burn_sub, srt_path=srt_path, segments=segments,
                         font_size=font_size,
-                        primary_color=hex_to_ass_color(text_color),
-                        outline_color=hex_to_ass_color(outline_color),
+                        text_color_hex=text_color, outline_color_hex=outline_color,
                         alignment=POSITION_OPTIONS[position_label],
                         margin_v=margin_v,
                         video_preset=speed_cfg["video_preset"],
                         hflip=v_hflip, frame_width=resolution[0] if resolution else None,
                     )
+                    finish_notes.extend(sub_notes)
                     current_video = processed_output
 
                 if enable_dub:
@@ -1725,19 +2174,20 @@ if start_button:
                     volume_str = f"{'+' if tts_volume_pct >= 0 else ''}{tts_volume_pct}%"
                     pitch_str = f"{'+' if tts_pitch_hz >= 0 else ''}{tts_pitch_hz}Hz"
 
-                    dub_track_path, failed_indices = build_dub_track(
+                    dub_track_path, failed_indices, dub_info = build_dub_track(
                         segments, voice, rate_str, volume_str, pitch_str, tmp_dir, total_duration,
                         concurrency=speed_cfg["tts_concurrency"],
-                        progress_cb=lambda d, t: tts_bar.progress(d / t, text=f"Đã đọc {d}/{t} câu")
+                        progress_cb=lambda d, t: tts_bar.progress(min(d / t, 1.0), text=f"Đã đọc {d}/{t} câu")
                     )
                     dub_warning_count = len(failed_indices)
+                    st.write(f"✅ Giọng đọc xong — {dub_info}")
 
                     st.write("🔀 Đang ghép giọng lồng tiếng vào video và tự động hạ âm lượng gốc...")
                     dub_output = os.path.join(tmp_dir, "with_dub.mp4")
                     combine_video_with_dub(current_video, dub_track_path, dub_output,
                                             keep_bg=keep_bg, bg_volume=original_volume_factor)
                     current_video = dub_output
-                elif original_volume_factor != 1.0:
+                elif original_volume_factor != 1.0 and has_audio_stream(current_video):
                     st.write("🔊 Đang điều chỉnh âm lượng video gốc...")
                     vol_output = os.path.join(tmp_dir, "with_volume.mp4")
                     adjust_video_volume(current_video, vol_output, original_volume_factor)
@@ -1746,13 +2196,13 @@ if start_button:
                 if need_finish:
                     st.write("🚀 Đang áp dụng Viral Boost (zoom, màu, chữ hook, tốc độ, 9:16, âm lượng...)...")
                     final_output = os.path.join(tmp_dir, "final.mp4")
-                    finish_notes = finish_video(
+                    finish_notes.extend(finish_video(
                         current_video, final_output, tmp_dir,
                         speed=v_speed, zoom_pct=v_zoom, color_boost=v_color, logo_corner=v_logo,
                         vertical=v_vertical, hook_text=v_hook, watermark_text=v_watermark,
                         progress_bar=v_progress, fade=v_fade, loudnorm=v_loud,
                         video_preset=speed_cfg["video_preset"],
-                    )
+                    ))
                     current_video = final_output
 
                 if v_thumb:
@@ -1777,20 +2227,22 @@ if start_button:
         except FFmpegError as e:
             status.update(label="Xử lý thất bại ❌", state="error")
             st.error(f"❌ {e}")
-            st.info("💡 Lỗi thường gặp: video có codec lạ, không có audio, vùng che phụ đề tràn khung hình, hoặc ffmpeg thiếu "
-                     "bộ lọc (vd drawtext). Thử video khác, tắt bớt hiệu ứng Viral Boost hoặc mở '⚙️ Tuỳ chỉnh nâng cao' "
-                     "để chỉnh vùng che.")
+            st.info("💡 Lỗi thường gặp: video có codec lạ, vùng che phụ đề tràn khung hình, hoặc ffmpeg thiếu "
+                     "bộ lọc (vd subtitles/drawtext — cần bản ffmpeg đầy đủ có libass, freetype). Thử video khác, "
+                     "tắt bớt hiệu ứng Viral Boost hoặc mở '⚙️ Tuỳ chỉnh nâng cao' để chỉnh vùng che.")
             st.stop()
         except Exception as e:
             status.update(label="Xử lý thất bại ❌", state="error")
-            st.error(f"❌ Lỗi không mong muốn: {e}")
+            st.error(f"❌ {e}")
             st.stop()
 
         if dub_warning_count > 0:
             st.warning(
-                f"⚠️ {dub_warning_count} câu AI không đọc được (có thể do mất kết nối mạng) "
-                "— các câu này đã được thay bằng khoảng lặng thay vì làm hỏng toàn bộ video."
+                f"⚠️ {dub_warning_count} câu AI không đọc được (lỗi mạng hoặc dịch vụ giọng đọc) "
+                "— các câu này được thay bằng khoảng lặng. " + (dub_info if dub_info else "")
             )
+        for w in translate_warnings:
+            st.warning(f"⚠️ {w}")
         for note in finish_notes:
             st.warning(f"⚠️ {note}")
 
@@ -1806,6 +2258,7 @@ if start_button:
             r1.metric("Số câu", len(segments))
             r2.metric("Thời lượng", f"{total_duration / v_speed:.0f}s")
             r3.metric("Câu lỗi TTS", dub_warning_count)
+            st.caption(f"Công cụ dịch: {engine_used}")
 
             tab_names = ["🎬 Video", "📜 Phụ đề"]
             if thumb_bytes:
